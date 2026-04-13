@@ -67,7 +67,7 @@ class MonitorGuiApp:
         self.date_var = tk.StringVar(value=today_text)
         self.config_var = tk.StringVar(value=str(self.default_config))
         self.log_level_var = tk.StringVar(value="INFO")
-        self.once_var = tk.BooleanVar(value=True)
+        self.run_mode_var = tk.StringVar(value="loop")
         self.email_alert_var = tk.BooleanVar(value=False)
 
         self.venue_display_to_value = self._load_venue_display_map(Path(self.config_var.get()))
@@ -138,8 +138,10 @@ class MonitorGuiApp:
 
         row4 = ttk.Frame(frame)
         row4.pack(fill=tk.X, pady=4)
-        ttk.Checkbutton(row4, text="Once", variable=self.once_var).pack(side=tk.LEFT)
-        ttk.Checkbutton(row4, text="Email Alert", variable=self.email_alert_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(row4, text="Run Mode").pack(side=tk.LEFT)
+        ttk.Radiobutton(row4, text="Continuous", variable=self.run_mode_var, value="loop").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(row4, text="Once", variable=self.run_mode_var, value="once").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(row4, text="Email Alert", variable=self.email_alert_var).pack(side=tk.LEFT, padx=(16, 0))
 
         self.start_btn = ttk.Button(row4, text="Start", command=self.start_monitor)
         self.start_btn.pack(side=tk.LEFT, padx=(16, 6))
@@ -353,7 +355,7 @@ class MonitorGuiApp:
         if date_text:
             cmd.extend(["--date", date_text])
 
-        if self.once_var.get():
+        if self.run_mode_var.get() == "once":
             cmd.append("--once")
 
         if self.email_alert_var.get():

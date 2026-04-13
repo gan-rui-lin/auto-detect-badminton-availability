@@ -114,6 +114,7 @@ python monitor_gui.py
 GUI 已支持：
 
 - 参数填写（sport / venue / time-range / date / once / email-alert）
+- 运行模式可选（`Continuous` 持续监测 / `Once` 单次检测，默认 `Continuous`）
 - 场馆多选列表（自动读取 `monitor.venue_code_map`，可同时监控多个场馆）
 - 日期默认今天，并支持日历控件选择（依赖 `tkcalendar`）
 - 时段多选列表（默认全选 `08:00-21:00`，可同时监控多个时段）
