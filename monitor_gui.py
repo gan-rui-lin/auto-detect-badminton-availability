@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 import importlib
 import locale
+import os
 import queue
 import smtplib
 import subprocess
@@ -41,7 +41,7 @@ class MonitorGuiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("ZHLJ Monitor GUI")
-        self.root.geometry("980x680")
+        self.root.geometry("1080x760")
 
         self.proc: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -64,31 +64,27 @@ class MonitorGuiApp:
 
         today_text = date.today().strftime("%Y-%m-%d")
         self.sport_var = tk.StringVar(value="badminton")
-        self.start_hour_var = tk.StringVar(value="20")
-        self.end_hour_var = tk.StringVar(value="21")
         self.date_var = tk.StringVar(value=today_text)
         self.config_var = tk.StringVar(value=str(self.default_config))
         self.log_level_var = tk.StringVar(value="INFO")
-        self.venue_display_to_value = self._load_venue_display_map(Path(self.config_var.get()))
-        venue_values = list(self.venue_display_to_value.keys())
-        self.venue_var = tk.StringVar(value=venue_values[0] if venue_values else "全部场馆")
-
         self.once_var = tk.BooleanVar(value=True)
         self.email_alert_var = tk.BooleanVar(value=False)
+
+        self.venue_display_to_value = self._load_venue_display_map(Path(self.config_var.get()))
+        self.venue_option_items: list[tuple[str, str]] = list(self.venue_display_to_value.items())
+        self.time_slot_values = [f"{h:02d}:00-{h + 1:02d}:00" for h in range(8, 21)]
 
         row1 = ttk.Frame(frame)
         row1.pack(fill=tk.X, pady=4)
         ttk.Label(row1, text="Sport").pack(side=tk.LEFT)
-        ttk.Combobox(row1, textvariable=self.sport_var, values=["badminton", "pingpong"], width=14, state="readonly").pack(side=tk.LEFT, padx=(8, 16))
-        ttk.Label(row1, text="Venue").pack(side=tk.LEFT)
-        self.venue_combo = ttk.Combobox(row1, textvariable=self.venue_var, values=venue_values, width=28, state="readonly")
-        self.venue_combo.pack(side=tk.LEFT, padx=(8, 16))
-        ttk.Label(row1, text="Time Range").pack(side=tk.LEFT)
-        hour_start_values = ["不限"] + [str(h) for h in range(0, 24)]
-        hour_end_values = ["不限"] + [str(h) for h in range(1, 25)]
-        ttk.Combobox(row1, textvariable=self.start_hour_var, values=hour_start_values, width=6, state="readonly").pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Label(row1, text="to").pack(side=tk.LEFT)
-        ttk.Combobox(row1, textvariable=self.end_hour_var, values=hour_end_values, width=6, state="readonly").pack(side=tk.LEFT, padx=(4, 16))
+        ttk.Combobox(
+            row1,
+            textvariable=self.sport_var,
+            values=["badminton", "pingpong"],
+            width=14,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(8, 16))
+
         ttk.Label(row1, text="Date").pack(side=tk.LEFT)
         if DateEntry is not None:
             self.date_picker = DateEntry(row1, textvariable=self.date_var, date_pattern="yyyy-mm-dd", width=12)
@@ -99,32 +95,67 @@ class MonitorGuiApp:
 
         row2 = ttk.Frame(frame)
         row2.pack(fill=tk.X, pady=4)
-        ttk.Label(row2, text="Config").pack(side=tk.LEFT)
-        ttk.Entry(row2, textvariable=self.config_var, width=62).pack(side=tk.LEFT, padx=(8, 8))
-        ttk.Button(row2, text="Reload Venues", command=self.reload_venue_options).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(row2, text="Log Level").pack(side=tk.LEFT)
-        ttk.Combobox(row2, textvariable=self.log_level_var, values=["DEBUG", "INFO", "WARNING", "ERROR"], width=10, state="readonly").pack(side=tk.LEFT, padx=(8, 0))
+
+        venue_panel = ttk.Frame(row2)
+        venue_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        ttk.Label(venue_panel, text="Venues (multi-select)").pack(anchor="w")
+        self.venue_listbox = tk.Listbox(venue_panel, selectmode=tk.MULTIPLE, exportselection=False, height=6)
+        self.venue_listbox.pack(fill=tk.BOTH, expand=True)
+        for label, _ in self.venue_option_items:
+            self.venue_listbox.insert(tk.END, label)
+        self._select_all_venues()
+        venue_btns = ttk.Frame(venue_panel)
+        venue_btns.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(venue_btns, text="All", command=self._select_all_venues).pack(side=tk.LEFT)
+        ttk.Button(venue_btns, text="Clear", command=self._clear_venues).pack(side=tk.LEFT, padx=(6, 0))
+
+        time_panel = ttk.Frame(row2)
+        time_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        ttk.Label(time_panel, text="Time Slots (multi-select, default 08:00-21:00)").pack(anchor="w")
+        self.time_listbox = tk.Listbox(time_panel, selectmode=tk.MULTIPLE, exportselection=False, height=6)
+        self.time_listbox.pack(fill=tk.BOTH, expand=True)
+        for slot in self.time_slot_values:
+            self.time_listbox.insert(tk.END, slot)
+        self._select_all_time_slots()
+        time_btns = ttk.Frame(time_panel)
+        time_btns.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(time_btns, text="All", command=self._select_all_time_slots).pack(side=tk.LEFT)
+        ttk.Button(time_btns, text="Clear", command=self._clear_time_slots).pack(side=tk.LEFT, padx=(6, 0))
 
         row3 = ttk.Frame(frame)
         row3.pack(fill=tk.X, pady=4)
-        ttk.Checkbutton(row3, text="Once", variable=self.once_var).pack(side=tk.LEFT)
-        ttk.Checkbutton(row3, text="Email Alert", variable=self.email_alert_var).pack(side=tk.LEFT, padx=(12, 0))
-
-        self.start_btn = ttk.Button(row3, text="Start", command=self.start_monitor)
-        self.start_btn.pack(side=tk.LEFT, padx=(16, 6))
-        self.stop_btn = ttk.Button(row3, text="Stop", command=self.stop_monitor)
-        self.stop_btn.pack(side=tk.LEFT)
-        ttk.Button(row3, text="Test Email Config", command=self.test_email_config).pack(side=tk.LEFT, padx=(12, 0))
-
-        ttk.Button(row3, text="Open Snapshot HTML", command=self.open_snapshot_html).pack(side=tk.LEFT, padx=(16, 6))
-        ttk.Button(row3, text="Open Snapshot PNG", command=self.open_snapshot_png).pack(side=tk.LEFT)
+        ttk.Label(row3, text="Config").pack(side=tk.LEFT)
+        ttk.Entry(row3, textvariable=self.config_var, width=60).pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Button(row3, text="Reload Venues", command=self.reload_venue_options).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(row3, text="Log Level").pack(side=tk.LEFT)
+        ttk.Combobox(
+            row3,
+            textvariable=self.log_level_var,
+            values=["DEBUG", "INFO", "WARNING", "ERROR"],
+            width=10,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         row4 = ttk.Frame(frame)
-        row4.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(row4, text="Enable Startup", command=self.enable_startup).pack(side=tk.LEFT)
-        ttk.Button(row4, text="Disable Startup", command=self.disable_startup).pack(side=tk.LEFT, padx=(6, 12))
+        row4.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(row4, text="Once", variable=self.once_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(row4, text="Email Alert", variable=self.email_alert_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        self.start_btn = ttk.Button(row4, text="Start", command=self.start_monitor)
+        self.start_btn.pack(side=tk.LEFT, padx=(16, 6))
+        self.stop_btn = ttk.Button(row4, text="Stop", command=self.stop_monitor)
+        self.stop_btn.pack(side=tk.LEFT)
+        ttk.Button(row4, text="Test Email Config", command=self.test_email_config).pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Button(row4, text="Open Snapshot HTML", command=self.open_snapshot_html).pack(side=tk.LEFT, padx=(16, 6))
+        ttk.Button(row4, text="Open Snapshot PNG", command=self.open_snapshot_png).pack(side=tk.LEFT)
+
+        row5 = ttk.Frame(frame)
+        row5.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(row5, text="Enable Startup", command=self.enable_startup).pack(side=tk.LEFT)
+        ttk.Button(row5, text="Disable Startup", command=self.disable_startup).pack(side=tk.LEFT, padx=(6, 12))
         self.startup_status_var = tk.StringVar(value="Startup: unknown")
-        ttk.Label(row4, textvariable=self.startup_status_var).pack(side=tk.LEFT)
+        ttk.Label(row5, textvariable=self.startup_status_var).pack(side=tk.LEFT)
 
     def _build_log_panel(self) -> None:
         log_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
@@ -140,6 +171,38 @@ class MonitorGuiApp:
         self._append_log("GUI ready. Click Start to run monitor_pc.py.\n")
         if DateEntry is None:
             self._append_log("Tip: install tkcalendar for graphical date picker: pip install tkcalendar\n")
+
+    def _select_all_venues(self) -> None:
+        if self.venue_listbox.size() > 0:
+            self.venue_listbox.select_set(0, tk.END)
+
+    def _clear_venues(self) -> None:
+        self.venue_listbox.selection_clear(0, tk.END)
+
+    def _select_all_time_slots(self) -> None:
+        if self.time_listbox.size() > 0:
+            self.time_listbox.select_set(0, tk.END)
+
+    def _clear_time_slots(self) -> None:
+        self.time_listbox.selection_clear(0, tk.END)
+
+    def _selected_venue_values(self) -> list[str]:
+        values: list[str] = []
+        for idx in self.venue_listbox.curselection():
+            if idx < 0 or idx >= len(self.venue_option_items):
+                continue
+            value = self.venue_option_items[idx][1]
+            if value:
+                values.append(value)
+        return values
+
+    def _selected_time_ranges(self) -> list[str]:
+        values: list[str] = []
+        for idx in self.time_listbox.curselection():
+            if idx < 0 or idx >= len(self.time_slot_values):
+                continue
+            values.append(self.time_slot_values[idx])
+        return values
 
     def _load_venue_display_map(self, config_path: Path) -> dict[str, str]:
         code_map: dict[str, str] = {}
@@ -160,8 +223,11 @@ class MonitorGuiApp:
         if not code_map:
             code_map = dict(DEFAULT_VENUE_CODE_MAP)
 
-        result = {"全部场馆": ""}
-        sorted_items = sorted(code_map.items(), key=lambda x: (not str(x[0]).isdigit(), int(x[0]) if str(x[0]).isdigit() else 9999, str(x[0])))
+        result: dict[str, str] = {}
+        sorted_items = sorted(
+            code_map.items(),
+            key=lambda x: (not str(x[0]).isdigit(), int(x[0]) if str(x[0]).isdigit() else 9999, str(x[0])),
+        )
         for code, name in sorted_items:
             result[f"{code} - {name}"] = code
         return result
@@ -169,12 +235,12 @@ class MonitorGuiApp:
     def reload_venue_options(self) -> None:
         cfg_text = self.config_var.get().strip() or str(self.default_config)
         self.venue_display_to_value = self._load_venue_display_map(Path(cfg_text))
-        venue_values = list(self.venue_display_to_value.keys())
-        self.venue_combo.configure(values=venue_values)
+        self.venue_option_items = list(self.venue_display_to_value.items())
 
-        current = self.venue_var.get().strip()
-        if current not in self.venue_display_to_value:
-            self.venue_var.set(venue_values[0] if venue_values else "")
+        self.venue_listbox.delete(0, tk.END)
+        for label, _ in self.venue_option_items:
+            self.venue_listbox.insert(tk.END, label)
+        self._select_all_venues()
 
         self._append_log("Venue options reloaded from config.\n")
 
@@ -265,32 +331,23 @@ class MonitorGuiApp:
         self.root.after(120, self._drain_log_queue)
 
     def _build_command(self) -> list[str]:
-        cmd = [sys.executable, str(self.monitor_script), "--config", self.config_var.get().strip() or str(self.default_config)]
+        cmd = [
+            sys.executable,
+            str(self.monitor_script),
+            "--config",
+            self.config_var.get().strip() or str(self.default_config),
+        ]
 
         sport = self.sport_var.get().strip() or "badminton"
         cmd.extend(["--sport", sport])
 
-        venue_key = self.venue_var.get().strip()
-        venue = self.venue_display_to_value.get(venue_key, "")
-        if venue:
-            cmd.extend(["--venue", venue])
+        selected_venues = self._selected_venue_values()
+        if selected_venues:
+            cmd.extend(["--venue", ",".join(selected_venues)])
 
-        start_txt = self.start_hour_var.get().strip()
-        end_txt = self.end_hour_var.get().strip()
-        unlimited = "不限"
-        if start_txt == unlimited and end_txt == unlimited:
-            pass
-        elif start_txt != unlimited and end_txt != unlimited:
-            try:
-                start_hour = int(start_txt)
-                end_hour = int(end_txt)
-            except ValueError as exc:
-                raise ValueError("Time Range must be integer hours.") from exc
-            if not (0 <= start_hour <= 23 and 1 <= end_hour <= 24 and start_hour < end_hour):
-                raise ValueError("Time Range requires start < end, start in [0,23], end in [1,24].")
-            cmd.extend(["--time-range", f"{start_hour:02d}:00-{end_hour:02d}:00"])
-        else:
-            raise ValueError("Please choose both start and end hours, or both set to 不限.")
+        selected_ranges = self._selected_time_ranges()
+        if selected_ranges:
+            cmd.extend(["--time-ranges", ",".join(selected_ranges)])
 
         date_text = self.date_var.get().strip()
         if date_text:
@@ -322,11 +379,7 @@ class MonitorGuiApp:
             messagebox.showerror("Missing File", f"File not found: {self.monitor_script}")
             return
 
-        try:
-            cmd = self._build_command()
-        except ValueError as exc:
-            messagebox.showerror("Invalid Parameters", str(exc))
-            return
+        cmd = self._build_command()
         self._append_log("\n=== START ===\n")
         self._append_log("Command: " + " ".join(cmd) + "\n")
 
@@ -442,7 +495,7 @@ def main() -> None:
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
-    app = MonitorGuiApp(root)
+    MonitorGuiApp(root)
     root.mainloop()
 
 

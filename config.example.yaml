@@ -45,16 +45,24 @@ navigation:
   click_xpaths: []
 
 monitor:
+  availability_mode: "api_dom" # api / dom / api_dom
   interval_sec: 20
   refresh_each_cycle: true
   navigate_each_cycle: false
   once_retries: 2
   once_retry_gap_sec: 1.2
   once_refresh_before_retry: true
+  keep_browser_open_on_exit: false
   dump_last_page_on_exit: true
   last_page_snapshot_file: "page_snapshot.html"
   last_page_screenshot_file: "page_snapshot.png"
   last_page_meta_file: "page_snapshot.meta.json"
+  dom_expand_all_venues: true
+  dom_expand_wait_sec: 0.35
+  dom_keyword_fallback: true
+  dump_dom_debug_on_check: false
+  dom_debug_file: "dom_debug.json"
+  dom_available_xpath_candidates: []
   dump_xpath_on_start: true
   xpath_dump_file: "xpath_candidates.json"
   dump_slot_debug_on_check: true

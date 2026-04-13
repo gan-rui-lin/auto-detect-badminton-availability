@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import smtplib
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -133,6 +134,22 @@ def parse_time_range(range_text: str) -> tuple[str, str]:
     return start, end
 
 
+def parse_time_ranges(ranges_text: str) -> List[tuple[str, str]]:
+    parts = [x.strip() for x in str(ranges_text or "").split(",") if x.strip()]
+    if not parts:
+        raise ValueError("--time-ranges 不能为空，例如 08:00-10:00,18:00-21:00")
+    ranges: List[tuple[str, str]] = []
+    seen = set()
+    for part in parts:
+        start, end = parse_time_range(part)
+        key = f"{start}-{end}"
+        if key in seen:
+            continue
+        seen.add(key)
+        ranges.append((start, end))
+    return ranges
+
+
 def _resolve_venue_keyword_from_code(cfg: Dict[str, Any], code_text: str) -> str:
     monitor = cfg.setdefault("monitor", {})
     configured = monitor.get("venue_code_map", {})
@@ -181,7 +198,10 @@ def apply_runtime_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> No
             dedup.append(f)
         monitor["venue_name_filters"] = dedup
 
-    if args.time_range:
+    if args.time_ranges:
+        ranges = parse_time_ranges(args.time_ranges)
+        monitor["time_ranges"] = [f"{start}-{end}" for start, end in ranges]
+    elif args.time_range:
         start, end = parse_time_range(args.time_range)
         monitor["time_range"] = f"{start}-{end}"
 
@@ -199,6 +219,9 @@ def apply_runtime_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> No
             email_cfg = {}
             notification["email"] = email_cfg
         email_cfg["enabled"] = True
+
+    if bool(getattr(args, "keep_browser_open", False)):
+        monitor["keep_browser_open_on_exit"] = True
 
 
 class ZhihuiLuojiaMonitor:
@@ -297,6 +320,7 @@ class ZhihuiLuojiaMonitor:
             submit_xpaths.append(submit_xpath)
         submit_xpaths.extend(
             [
+                '/html/body/div/div[2]/div[3]/div[2]/div[5]/div[2]/form/p[2]/button',
                 '//*[@id="login_submit"]',
                 '//button[@type="submit"]',
                 '//input[@type="submit"]',
@@ -635,14 +659,35 @@ fetch(url, {
         return (eh * 60 + em) - (sh * 60 + sm)
 
     def _in_time_range(self, start_hm: str, end_hm: str) -> bool:
-        raw = str(self.monitor.get("time_range", "")).strip()
-        if not raw:
+        ranges_raw = self.monitor.get("time_ranges", [])
+        parsed_ranges: List[tuple[str, str]] = []
+
+        if isinstance(ranges_raw, list) and ranges_raw:
+            for item in ranges_raw:
+                text = str(item).strip()
+                if not text:
+                    continue
+                try:
+                    parsed_ranges.append(parse_time_range(text))
+                except ValueError:
+                    continue
+
+        if not parsed_ranges:
+            raw = str(self.monitor.get("time_range", "")).strip()
+            if raw:
+                try:
+                    parsed_ranges.append(parse_time_range(raw))
+                except ValueError:
+                    pass
+
+        if not parsed_ranges:
             return True
-        try:
-            range_start, range_end = parse_time_range(raw)
-        except ValueError:
-            return True
-        return start_hm >= range_start and end_hm <= range_end
+
+        # Overlap match so coarse blocks like 18:00-21:00 can match selected sub-ranges.
+        for range_start, range_end in parsed_ranges:
+            if start_hm < range_end and end_hm > range_start:
+                return True
+        return False
 
     def _venue_name_matched(self, venue_name: str) -> bool:
         raw = self.monitor.get("venue_name_filters", [])
@@ -797,20 +842,449 @@ fetch(url, {
             )
         return result
 
+    def _collect_known_venue_names(self) -> List[str]:
+        names: List[str] = []
+
+        configured = self.monitor.get("venue_code_map", {})
+        if isinstance(configured, dict):
+            for _, value in configured.items():
+                venue_name = normalize_text(str(value))
+                if venue_name:
+                    names.append(venue_name)
+
+        for value in DEFAULT_VENUE_CODE_MAP.values():
+            venue_name = normalize_text(str(value))
+            if venue_name:
+                names.append(venue_name)
+
+        raw_filters = self.monitor.get("venue_name_filters", [])
+        if isinstance(raw_filters, list):
+            for value in raw_filters:
+                venue_name = normalize_text(str(value))
+                if venue_name:
+                    names.append(venue_name)
+
+        deduped: List[str] = []
+        seen = set()
+        for name in names:
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(name)
+        return deduped
+
+    def _extract_time_labels_from_text(self, text: str) -> List[str]:
+        labels: List[str] = []
+        for match in re.finditer(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", str(text)):
+            start = match.group(1).zfill(5)
+            end = match.group(2).zfill(5)
+            if start >= end:
+                continue
+            duration = self._duration_minutes(start, end)
+            if duration < 45 or duration > 90:
+                continue
+            if not self._in_time_range(start, end):
+                continue
+            labels.append(f"{start}-{end}")
+
+        deduped: List[str] = []
+        seen = set()
+        for label in labels:
+            if label in seen:
+                continue
+            seen.add(label)
+            deduped.append(label)
+        return deduped
+
+    def _build_venue_result_from_court_slots(
+        self,
+        venue_name: str,
+        court_slots: Dict[str, set[str]],
+        source: str,
+    ) -> Dict[str, Any]:
+        detail_court_availability: Dict[str, List[str]] = {}
+        for court_name, slots in court_slots.items():
+            sorted_slots = sorted(slots)
+            if sorted_slots:
+                detail_court_availability[court_name] = sorted_slots
+
+        slot_details: List[Dict[str, Any]] = []
+        for court_name, slots in detail_court_availability.items():
+            for label in slots:
+                idx = self._period_index_from_label(label)
+                slot_details.append(
+                    {
+                        "period_index": idx,
+                        "time_label": label,
+                        "segment": self._segment_name(idx) if idx > 0 else self._segment_name_from_time_label(label),
+                        "available": True,
+                        "court": court_name,
+                        "source": source,
+                    }
+                )
+
+        segment_count: Dict[str, int] = {}
+        for slot in slot_details:
+            seg = str(slot.get("segment", "other"))
+            segment_count[seg] = segment_count.get(seg, 0) + 1
+
+        return {
+            "venue_index": 0,
+            "venue_name": venue_name,
+            "available_total": len(slot_details),
+            "segment_count": segment_count,
+            "slot_details": slot_details,
+            "court_availability": detail_court_availability,
+        }
+
+    def _structured_availability_via_dom(self) -> List[Dict[str, Any]]:
+        driver = self._must_driver()
+
+        if bool(self.monitor.get("dom_expand_all_venues", True)):
+            try:
+                opened = driver.execute_script(
+                    r"""
+const items = Array.from(document.querySelectorAll('.uni-collapse-item'));
+let clicked = 0;
+for (const item of items) {
+  const wrap = item.querySelector('.uni-collapse-item__wrap');
+  const h = wrap ? ((wrap.style && wrap.style.height) || '') : '';
+  const isOpen = !!(h && h !== '0px');
+  if (isOpen) continue;
+  const title = item.querySelector('.uni-collapse-item__title-wrap') || item.querySelector('.uni-collapse-item__title');
+  if (title) {
+    title.click();
+    clicked += 1;
+  }
+}
+return clicked;
+"""
+                )
+                wait_sec = float(self.monitor.get("dom_expand_wait_sec", 0.35))
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+                if int(opened or 0) > 0:
+                    LOGGER.info("DOM检测前已尝试展开场馆面板: %s", opened)
+            except WebDriverException:
+                LOGGER.warning("DOM面板展开失败，继续使用当前页面状态")
+
+        debug_records: List[Dict[str, Any]] = []
+        booking_court_slots_by_venue: Dict[str, Dict[str, set[str]]] = {}
+        booking_hit_count = 0
+
+        try:
+            booking_rows = driver.execute_script(
+                r"""
+function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+function slotText(cell) {
+  if (!cell) return '';
+  const txt = norm(cell.innerText || '');
+  return txt.replace(/\s*—\s*/g, '-').replace(/\s*~\s*/g, '-');
+}
+
+const items = Array.from(document.querySelectorAll('.uni-collapse-item'));
+return items.map((item, idx) => {
+  const venueName = norm((item.querySelector('.site-cont .name') || {}).innerText || '');
+  const booking = item.querySelector('.booking');
+  const rows = [];
+  if (booking) {
+    const lists = Array.from(booking.querySelectorAll('.booking-list'));
+    for (const row of lists) {
+      const court = norm((row.querySelector('.li.no') || {}).innerText || '');
+      const cells = Array.from(row.querySelectorAll('.li .time'));
+      const slots = cells.map((cell) => {
+        const statusNode = cell.querySelector('.tt');
+        const status = norm(statusNode ? statusNode.innerText : '');
+        return {
+          text: slotText(cell),
+          status,
+          disabled: !!cell.classList.contains('disable'),
+        };
+      });
+      rows.push({ court, slots });
+    }
+  }
+  return {
+    index: idx + 1,
+    venue: venueName,
+    hasBooking: !!booking,
+    rows,
+    digest: norm(item.innerText || '').slice(0, 300),
+  };
+});
+"""
+            )
+        except WebDriverException:
+            booking_rows = []
+
+        if isinstance(booking_rows, list):
+            for venue_item in booking_rows:
+                if not isinstance(venue_item, dict):
+                    continue
+
+                venue_name = normalize_text(str(venue_item.get("venue", ""))) or f"DOM场馆-{int(venue_item.get('index', 0) or 0)}"
+                if not self._venue_name_matched(venue_name):
+                    continue
+
+                rows = venue_item.get("rows", [])
+                if not isinstance(rows, list):
+                    rows = []
+
+                venue_map = booking_court_slots_by_venue.setdefault(venue_name, {})
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    court_text = normalize_text(str(row.get("court", "")))
+                    court_match = re.search(r"(\d{1,3})", court_text)
+                    court_name = f"{court_match.group(1)}号场" if court_match else (court_text or "未知场地")
+
+                    slots = row.get("slots", [])
+                    if not isinstance(slots, list):
+                        slots = []
+
+                    slot_set = venue_map.setdefault(court_name, set())
+                    for slot in slots:
+                        if not isinstance(slot, dict):
+                            continue
+                        status = normalize_text(str(slot.get("status", "")))
+                        if "有" not in status:
+                            continue
+
+                        text = normalize_text(str(slot.get("text", "")))
+                        labels = self._extract_time_labels_from_text(text)
+                        for label in labels:
+                            slot_set.add(label)
+                            booking_hit_count += 1
+
+                        if len(debug_records) < 200:
+                            debug_records.append(
+                                {
+                                    "source": "booking",
+                                    "venue": venue_name,
+                                    "court": court_name,
+                                    "status": status,
+                                    "text": text,
+                                    "labels": labels,
+                                }
+                            )
+
+        available_keywords = [str(x).strip() for x in self.monitor.get("available_keywords", []) if str(x).strip()]
+        unavailable_keywords = [str(x).strip() for x in self.monitor.get("unavailable_keywords", []) if str(x).strip()]
+        available_class_keywords = [str(x).strip().lower() for x in self.monitor.get("available_class_keywords", []) if str(x).strip()]
+        unavailable_class_keywords = [str(x).strip().lower() for x in self.monitor.get("unavailable_class_keywords", []) if str(x).strip()]
+
+        default_xpaths = [
+            '//*[contains(normalize-space(.), "可预约")]',
+            '//*[contains(normalize-space(.), "有余量")]',
+            '//*[contains(normalize-space(.), "余量")]',
+            '//*[contains(normalize-space(.), "空闲")]',
+            '//*[contains(normalize-space(.), "可约")]',
+        ]
+        use_keyword_fallback = bool(self.monitor.get("dom_keyword_fallback", True))
+        configured_xpaths = self.monitor.get("dom_available_xpath_candidates", self.monitor.get("available_xpath_candidates", []))
+        xpath_candidates: List[str] = []
+        if use_keyword_fallback and isinstance(configured_xpaths, list):
+            xpath_candidates = [str(x).strip() for x in configured_xpaths if str(x).strip()]
+        if use_keyword_fallback and not xpath_candidates:
+            xpath_candidates = default_xpaths
+
+        known_venues = self._collect_known_venue_names()
+        venue_filters = [normalize_text(str(x)) for x in self.monitor.get("venue_name_filters", []) if normalize_text(str(x))]
+        default_venue_name = venue_filters[0] if len(venue_filters) == 1 else ""
+
+        keyword_court_slots_by_venue: Dict[str, Dict[str, set[str]]] = {}
+        keyword_hit_count = 0
+
+        for xpath in xpath_candidates:
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+            except WebDriverException:
+                continue
+
+            for element in elements:
+                try:
+                    if not element.is_displayed():
+                        continue
+                    text = normalize_text(element.text)
+                    class_text = normalize_text(str(element.get_attribute("class") or "")).lower()
+                    contexts = driver.execute_script(
+                        r"""
+const el = arguments[0];
+function norm(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+const out = [];
+let cur = el;
+for (let i = 0; i < 8 && cur; i++) {
+  const txt = norm(cur.innerText || '');
+  if (txt && txt.length <= 360 && out.indexOf(txt) === -1) {
+    out.push(txt);
+  }
+  cur = cur.parentElement;
+}
+return out;
+""",
+                        element,
+                    )
+                    context_text = " ".join([normalize_text(str(x)) for x in contexts if normalize_text(str(x))])
+                    merged_text = normalize_text(f"{text} {context_text}")
+
+                    has_available_text = any(kw in merged_text for kw in available_keywords) if available_keywords else False
+                    has_unavailable_text = any(kw in merged_text for kw in unavailable_keywords) if unavailable_keywords else False
+                    has_available_class = any(kw in class_text for kw in available_class_keywords) if available_class_keywords else False
+                    has_unavailable_class = any(kw in class_text for kw in unavailable_class_keywords) if unavailable_class_keywords else False
+
+                    if not (has_available_text or has_available_class):
+                        continue
+                    if (has_unavailable_text or has_unavailable_class) and not has_available_text:
+                        continue
+
+                    time_labels = self._extract_time_labels_from_text(merged_text)
+                    if not time_labels:
+                        continue
+
+                    venue_name = ""
+                    for candidate in known_venues:
+                        if candidate and candidate in merged_text:
+                            venue_name = candidate
+                            break
+                    if not venue_name and default_venue_name:
+                        venue_name = default_venue_name
+                    if not venue_name:
+                        m_venue = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()\-]{2,30}体育馆(?:（[^）]+）)?)", merged_text)
+                        if m_venue:
+                            venue_name = normalize_text(m_venue.group(1))
+                    if not venue_name:
+                        venue_name = "DOM识别场馆"
+
+                    court_match = re.search(r"(\d{1,3})\s*号场", merged_text)
+                    court_name = f"{court_match.group(1)}号场" if court_match else "未知场地"
+
+                    if not self._venue_name_matched(venue_name):
+                        continue
+
+                    venue_map = keyword_court_slots_by_venue.setdefault(venue_name, {})
+                    slot_set = venue_map.setdefault(court_name, set())
+                    for label in time_labels:
+                        slot_set.add(label)
+                        keyword_hit_count += 1
+
+                    if len(debug_records) < 200:
+                        debug_records.append(
+                            {
+                                "source": "keyword",
+                                "xpath": xpath,
+                                "venue": venue_name,
+                                "court": court_name,
+                                "labels": time_labels,
+                                "text": text,
+                                "context": context_text,
+                            }
+                        )
+                except WebDriverException:
+                    continue
+
+        if bool(self.monitor.get("dump_dom_debug_on_check", False)):
+            debug_file = str(self.monitor.get("dom_debug_file", "dom_debug.json")).strip() or "dom_debug.json"
+            try:
+                Path(debug_file).write_text(
+                    json.dumps(
+                        {
+                            "time": datetime.now().isoformat(timespec="seconds"),
+                            "booking_hit_count": booking_hit_count,
+                            "keyword_hit_count": keyword_hit_count,
+                            "records": debug_records,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                LOGGER.exception("DOM 调试文件写入失败")
+
+        merged_dom_slots: Dict[str, Dict[str, set[str]]] = {}
+        for source_slots in [booking_court_slots_by_venue, keyword_court_slots_by_venue]:
+            for venue_name, court_slots in source_slots.items():
+                vm = merged_dom_slots.setdefault(venue_name, {})
+                for court_name, labels in court_slots.items():
+                    sm = vm.setdefault(court_name, set())
+                    for label in labels:
+                        sm.add(label)
+
+        result: List[Dict[str, Any]] = []
+        for venue_name, court_slots in merged_dom_slots.items():
+            result.append(self._build_venue_result_from_court_slots(venue_name, court_slots, source="dom_hybrid"))
+
+        if result:
+            LOGGER.info("DOM补充命中: booking=%s keyword=%s venues=%s", booking_hit_count, keyword_hit_count, len(result))
+        return result
+
     def _structured_availability(self) -> List[Dict[str, Any]]:
-        return self._structured_availability_via_api()
+        mode = str(self.monitor.get("availability_mode", "api_dom")).strip().lower()
+        api_modes = {"api", "api_dom", "dom_api", "hybrid", "both"}
+        dom_modes = {"dom", "api_dom", "dom_api", "hybrid", "both"}
+
+        api_venues: List[Dict[str, Any]] = []
+        dom_venues: List[Dict[str, Any]] = []
+
+        if mode in api_modes:
+            try:
+                api_venues = self._structured_availability_via_api()
+            except Exception:
+                LOGGER.exception("API检测失败")
+
+        if mode in dom_modes:
+            try:
+                dom_venues = self._structured_availability_via_dom()
+            except Exception:
+                LOGGER.exception("DOM检测失败")
+
+        if mode == "api":
+            return api_venues
+        if mode == "dom":
+            return dom_venues
+        return api_venues + dom_venues
+
+    def _merge_venues_by_name(self, venues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for venue in venues:
+            venue_name = normalize_text(str(venue.get("venue_name", ""))) or str(venue.get("venue_index", ""))
+            key = venue_name.lower()
+            node = merged.get(key)
+            if node is None:
+                node = {
+                    "venue_index": int(venue.get("venue_index", 0) or 0),
+                    "venue_name": venue_name,
+                    "court_slots": {},
+                }
+                merged[key] = node
+
+            court_avail = venue.get("court_availability", {})
+            if isinstance(court_avail, dict):
+                court_slots = node["court_slots"]
+                for court_name, labels in court_avail.items():
+                    court_key = normalize_text(str(court_name)) or "未知场地"
+                    label_set = court_slots.setdefault(court_key, set())
+                    if isinstance(labels, list):
+                        for label in labels:
+                            label_text = normalize_text(str(label))
+                            if label_text:
+                                label_set.add(label_text)
+
+        result: List[Dict[str, Any]] = []
+        for node in merged.values():
+            venue_result = self._build_venue_result_from_court_slots(
+                venue_name=str(node.get("venue_name", "")),
+                court_slots=node.get("court_slots", {}),
+                source="merged",
+            )
+            venue_result["venue_index"] = int(node.get("venue_index", 0) or 0)
+            result.append(venue_result)
+        return result
 
     def check_availability(self) -> Dict[str, Any]:
         self._ensure_reserve_page()
-        venues = self._structured_availability()
-
-        deduped_by_name: Dict[str, Dict[str, Any]] = {}
-        for v in venues:
-            key = normalize_text(str(v.get("venue_name", ""))) or str(v.get("venue_index", ""))
-            old = deduped_by_name.get(key)
-            if old is None or int(v.get("available_total", 0)) > int(old.get("available_total", 0)):
-                deduped_by_name[key] = v
-        venues = list(deduped_by_name.values())
+        venues = self._merge_venues_by_name(self._structured_availability())
 
         positives: List[str] = []
         for venue in venues:
@@ -1049,7 +1523,7 @@ def run_loop(monitor: ZhihuiLuojiaMonitor) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="智慧珞珈场馆余量监测（API-only）")
+    parser = argparse.ArgumentParser(description="智慧珞珈场馆余量监测（API+DOM）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--once", action="store_true", help="只检测一次")
     parser.add_argument(
@@ -1060,8 +1534,10 @@ def main() -> None:
     )
     parser.add_argument("--venue", help="场馆筛选，支持多选逗号分隔；可用编号映射或名称关键字，例如 1,3 或 风雨,竹园")
     parser.add_argument("--time-range", help="时段范围过滤，格式 HH:MM-HH:MM，例如 18:00-21:00")
+    parser.add_argument("--time-ranges", help="多时段过滤，逗号分隔，例如 08:00-10:00,18:00-21:00")
     parser.add_argument("--date", help="查询日期，格式 YYYY-MM-DD，例如 2026-04-14")
     parser.add_argument("--email-alert", action="store_true", help="检测到余量时发送邮件通知（需配置 notification.email）")
+    parser.add_argument("--keep-browser-open", action="store_true", help="结束后保留浏览器，按回车再关闭，便于现场排查")
     parser.add_argument("--log-level", default="INFO", help="日志级别")
     args = parser.parse_args()
 
@@ -1078,6 +1554,14 @@ def main() -> None:
             run_loop(monitor)
     finally:
         monitor.dump_last_page_debug_artifacts()
+        if bool(monitor.monitor.get("keep_browser_open_on_exit", False)):
+            if sys.stdin is not None and sys.stdin.isatty():
+                try:
+                    input("浏览器已保留用于排查，按回车后关闭浏览器并退出...\n")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+            else:
+                LOGGER.info("keep_browser_open_on_exit 已开启，但当前非交互终端，跳过等待。")
         monitor.close()
 
 

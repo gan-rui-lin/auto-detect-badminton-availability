@@ -1,6 +1,6 @@
-# 智慧珞珈场馆监控（API-only）
+# 智慧珞珈场馆监控（API + DOM）
 
-当前版本仅使用接口数据进行余量分析，不再依赖预约页/详情页的 DOM 结构。
+当前版本默认采用 API + DOM 双通道校验：优先使用接口数据，并用页面可见信息补充，降低漏报概率。
 
 ## 功能
 
@@ -34,9 +34,17 @@ pip install "tkcalendar>=1.6.1"
 - booking.sport_type_map: 球类到 typeId 的映射
 - booking.next_day: 未指定 --date 时是否默认查次日
 - monitor.interval_sec: 轮询间隔
+- monitor.availability_mode: 检测模式（`api` / `dom` / `api_dom`，默认 `api_dom`）
 - monitor.once_retries: `--once` 模式下额外重试次数（默认 2）
 - monitor.once_retry_gap_sec: `--once` 模式重试间隔秒数（默认 1.2）
 - monitor.once_refresh_before_retry: `--once` 重试前是否刷新页面
+- monitor.keep_browser_open_on_exit: 结束后保留浏览器（交互终端按回车再关闭）
+- monitor.dom_expand_all_venues: DOM 检测前自动展开所有场馆面板
+- monitor.dom_expand_wait_sec: 展开面板后的等待秒数
+- monitor.dom_keyword_fallback: 结构化解析之外是否启用关键词兜底
+- monitor.dump_dom_debug_on_check: 是否每轮输出 DOM 命中调试文件
+- monitor.dom_debug_file: DOM 调试输出文件（默认 `dom_debug.json`）
+- monitor.dom_available_xpath_candidates: DOM 补充检测使用的 XPath 候选列表
 - monitor.dump_last_page_on_exit: 退出前是否保存最后页面调试文件
 - monitor.last_page_snapshot_file: 最后页面 HTML 文件路径
 - monitor.last_page_screenshot_file: 最后页面截图文件路径
@@ -106,9 +114,9 @@ python monitor_gui.py
 GUI 已支持：
 
 - 参数填写（sport / venue / time-range / date / once / email-alert）
-- 场馆下拉框（自动读取 `monitor.venue_code_map`，默认含 1-6 场馆）
+- 场馆多选列表（自动读取 `monitor.venue_code_map`，可同时监控多个场馆）
 - 日期默认今天，并支持日历控件选择（依赖 `tkcalendar`）
-- 时间范围用开始/结束两个整数小时下拉（自动拼接为 `HH:00-HH:00`）
+- 时段多选列表（默认全选 `08:00-21:00`，可同时监控多个时段）
 - 一键测试邮箱配置（`Test Email Config`）
 - 一键启动/停止监控
 - 实时查看日志输出
@@ -170,6 +178,12 @@ python monitor_pc.py --once --venue 风雨,竹园 --date 2026-04-14
 python monitor_pc.py --once --time-range 18:00-21:00 --date 2026-04-14
 ```
 
+按多时间范围筛选（多个时段并集）：
+
+```bash
+python monitor_pc.py --once --time-ranges 08:00-10:00,18:00-21:00 --date 2026-04-14
+```
+
 组合使用（场馆 + 时间范围）：
 
 ```bash
@@ -180,6 +194,12 @@ python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 
 
 ```bash
 python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 --date 2026-04-14 --email-alert
+```
+
+保留浏览器用于现场排查（推荐）：
+
+```bash
+python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 --date 2026-04-14 --keep-browser-open
 ```
 
 羽毛球场馆编号映射（默认，可在 `monitor.venue_code_map` 自定义）：
@@ -226,6 +246,9 @@ python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 
 1. `--once` 模式如果担心瞬时漏报，可保留 `monitor.once_retries: 2`（总共检测 3 轮）
 2. 程序退出时会保存最后页面到 `page_snapshot.html`、`page_snapshot.png` 和 `page_snapshot.meta.json`
 3. 这些文件可直接用于后续 GUI 小应用联调和问题复现
+4. 若要定位 DOM 漏检，先设 `monitor.dump_dom_debug_on_check: true`，查看 `dom_debug.json`
+5. 如需人工 inspect，建议使用 `--keep-browser-open`，检测结束后在浏览器中 F12 检查元素
+6. 拿到更稳定的元素路径后，填写 `monitor.dom_available_xpath_candidates` 可提升 DOM 命中率
 
 ## 后台启动与关闭（Windows）
 
