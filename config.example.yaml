@@ -1,0 +1,97 @@
+browser:
+  headless: false
+  user_data_dir: ""
+  page_load_timeout_sec: 40
+  implicit_wait_sec: 2
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+portal:
+  home_url: "https://zhlj.whu.edu.cn/mobile/homepage"
+  login_url: "https://cas.whu.edu.cn/authserver/login?service=https://zhlj.whu.edu.cn/mobile/person/caslogin?b=/homepage"
+  reserve_url_template: "https://gym.whu.edu.cn/hsdsqhafive/pages/index/reserve?typeId={type_id}"
+  type_id: 21
+
+auth:
+  username: ""
+  password: ""
+  username_xpath: '//*[@id="username"]'
+  username_xpaths:
+    - '//*[@id="username"]'
+    - '//input[@name="username"]'
+    - '//input[contains(@placeholder, "用户名")]'
+  password_xpath: '//*[@id="password"]'
+  password_xpaths:
+    - '//*[@id="password"]'
+    - '//input[@name="password"]'
+    - '//input[contains(@type, "password")]'
+  submit_xpath: '//button[@type="submit"]'
+  submit_xpaths:
+    - '//*[@id="login_submit"]'
+    - '//button[@type="submit"]'
+    - '//input[@type="submit"]'
+  login_success_xpath: '//*[@id="swiper-apply"]/h3/span[3]'
+  login_success_url_contains: "/mobile/homepage"
+  max_login_attempts: 6
+  success_timeout_sec: 20
+
+captcha:
+  enabled: true
+  image_xpath: '//img[contains(@src, "captcha")]'
+  input_xpath: '//input[contains(@placeholder, "验证码") or contains(@id, "captcha")]'
+  refresh_xpath: '//img[contains(@src, "captcha")]'
+  max_attempts_per_login: 3
+
+navigation:
+  click_xpaths: []
+
+monitor:
+  interval_sec: 20
+  refresh_each_cycle: true
+  navigate_each_cycle: false
+  dump_xpath_on_start: true
+  xpath_dump_file: "xpath_candidates.json"
+  dump_html_on_check: false
+  html_snapshot_file: "page_snapshot.html"
+  analysis_wait_sec: 0.25
+  max_venues: 6
+  venue_xpath_template: '//*[@id="app"]/uni-app/uni-page/uni-page-wrapper/uni-page-body/uni-view/uni-view[2]/uni-view[2]/uni-view/uni-view[{venue_index}]'
+  period_xpath_template: '//*[@id="app"]/uni-app/uni-page/uni-page-wrapper/uni-page-body/uni-view/uni-view[1]/uni-view[2]/uni-view[3]/uni-view[{period_index}]'
+  period_indexes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+  period_segments:
+    morning: [1, 2, 3, 4, 5]
+    afternoon: [6, 7, 8, 9]
+    evening: [10, 11, 12, 13]
+  available_xpath_candidates:
+    - '//*[contains(normalize-space(.), "可预约")]'
+    - '//*[contains(normalize-space(.), "余量")]'
+    - '//*[contains(normalize-space(.), "空闲")]'
+    - '//*[contains(normalize-space(.), "可约")]'
+  available_keywords: ["可预约", "有余量", "余量", "空闲", "可约"]
+  unavailable_keywords: ["约满", "无余量", "不可预约", "已约满", "暂无"]
+  available_class_keywords: ["available", "green", "active", "can"]
+  unavailable_class_keywords: ["disabled", "gray", "grey", "full", "ban", "soldout"]
+  alert_cooldown_sec: 300
+
+booking:
+  enabled: false
+  book_once: true
+  sport_key: "badminton" # badminton / pingpong，可在源码 SPORT_TYPE_MAP 中扩展
+  sport_type_map:
+    badminton: 21
+    pingpong: 22
+  next_day: true
+  next_day_xpath: '//*[@id="app"]/uni-app/uni-page/uni-page-wrapper/uni-page-body/uni-view/uni-view[1]/uni-view[1]/uni-view[3]'
+  venue_xpath: '//*[@id="app"]/uni-app/uni-page/uni-page-wrapper/uni-page-body/uni-view/uni-view[2]/uni-view[2]/uni-view/uni-view[1]'
+  court_number: 6
+  court_row_offset: 1
+  period_indexes: [10]
+  period_xpath_template: '//*[@id="app"]/uni-app/uni-page/uni-page-wrapper/uni-page-body/uni-view/uni-view[1]/uni-view[2]/uni-view[3]/uni-view[{period_index}]'
+  court_xpath_template: '//*[@class="uni-collapse-item__wrap is--transition"]/uni-view/uni-view/uni-view[{court_row_index}]/uni-view[5]/uni-text/span'
+  submit_order_xpath: '//*[@id="app"]/uni-app/uni-page/uni-page-wrapper/uni-page-body/uni-view/uni-view[1]/uni-view[3]/uni-view[2]/uni-view[3]'
+  mask_xpath: '//uni-view[contains(@class,"mask") and contains(@class,"zindex")]'
+  mask_timeout_sec: 6
+  step_wait_sec: 0.4
+
+notification:
+  webhook_url: ""
+  beep: true

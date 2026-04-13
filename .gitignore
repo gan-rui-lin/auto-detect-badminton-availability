@@ -1,0 +1,5 @@
+__pycache__\
+*.pyc
+config.yaml
+xpath_candidates.json
+*.html
