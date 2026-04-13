@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import importlib
 import locale
 import queue
+import smtplib
 import subprocess
 import sys
 import threading
-from datetime import date
+from datetime import date, datetime
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 import tkinter as tk
@@ -19,8 +22,8 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 try:
-    from tkcalendar import DateEntry
-except ImportError:  # pragma: no cover
+    DateEntry = importlib.import_module("tkcalendar").DateEntry
+except Exception:  # pragma: no cover
     DateEntry = None
 
 
@@ -111,6 +114,7 @@ class MonitorGuiApp:
         self.start_btn.pack(side=tk.LEFT, padx=(16, 6))
         self.stop_btn = ttk.Button(row3, text="Stop", command=self.stop_monitor)
         self.stop_btn.pack(side=tk.LEFT)
+        ttk.Button(row3, text="Test Email Config", command=self.test_email_config).pack(side=tk.LEFT, padx=(12, 0))
 
         ttk.Button(row3, text="Open Snapshot HTML", command=self.open_snapshot_html).pack(side=tk.LEFT, padx=(16, 6))
         ttk.Button(row3, text="Open Snapshot PNG", command=self.open_snapshot_png).pack(side=tk.LEFT)
@@ -176,6 +180,76 @@ class MonitorGuiApp:
 
     def set_today(self) -> None:
         self.date_var.set(date.today().strftime("%Y-%m-%d"))
+
+    def _load_config_dict(self) -> dict[str, Any]:
+        if yaml is None:
+            raise ValueError("PyYAML is not installed. Please run: pip install pyyaml")
+        cfg_text = self.config_var.get().strip() or str(self.default_config)
+        config_path = Path(cfg_text)
+        if not config_path.exists():
+            raise ValueError(f"Config file not found: {config_path}")
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Config format invalid: root must be an object.")
+        return data
+
+    def test_email_config(self) -> None:
+        try:
+            data = self._load_config_dict()
+            notification = data.get("notification", {}) if isinstance(data, dict) else {}
+            email_cfg = notification.get("email", {}) if isinstance(notification, dict) else {}
+            if not isinstance(email_cfg, dict):
+                raise ValueError("notification.email config is missing or invalid.")
+
+            smtp_host = str(email_cfg.get("smtp_host", "")).strip()
+            smtp_port = int(email_cfg.get("smtp_port", 465) or 465)
+            use_ssl = bool(email_cfg.get("use_ssl", True))
+            use_starttls = bool(email_cfg.get("use_starttls", True))
+            username = str(email_cfg.get("username", "")).strip()
+            password = str(email_cfg.get("password", "")).strip()
+            from_addr = str(email_cfg.get("from_addr", username)).strip()
+
+            to_addrs_raw = email_cfg.get("to_addrs", [])
+            to_addrs: list[str] = []
+            if isinstance(to_addrs_raw, list):
+                to_addrs = [str(x).strip() for x in to_addrs_raw if str(x).strip()]
+            elif isinstance(to_addrs_raw, str):
+                to_addrs = [x.strip() for x in to_addrs_raw.replace(";", ",").split(",") if x.strip()]
+
+            if not smtp_host or not from_addr or not to_addrs:
+                raise ValueError("Please set smtp_host/from_addr/to_addrs in notification.email.")
+
+            subject_prefix = str(email_cfg.get("subject_prefix", "[场馆余量提醒]")).strip() or "[场馆余量提醒]"
+            msg = EmailMessage()
+            msg["Subject"] = f"{subject_prefix} GUI测试 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            msg["From"] = from_addr
+            msg["To"] = ", ".join(to_addrs)
+            msg.set_content(
+                "This is a test email from monitor_gui.py.\n"
+                f"time={datetime.now().isoformat(timespec='seconds')}\n"
+                f"smtp_host={smtp_host}:{smtp_port}\n",
+                charset="utf-8",
+            )
+
+            self._append_log("Testing email config...\n")
+            if use_ssl:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
+                    if username and password:
+                        server.login(username, password)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+                    if use_starttls:
+                        server.starttls()
+                    if username and password:
+                        server.login(username, password)
+                    server.send_message(msg)
+
+            self._append_log(f"Test email sent successfully to: {', '.join(to_addrs)}\n")
+            messagebox.showinfo("Email Test", "Test email sent successfully.")
+        except Exception as exc:
+            self._append_log(f"Test email failed: {exc}\n")
+            messagebox.showerror("Email Test Failed", str(exc))
 
     def _append_log(self, text: str) -> None:
         self.log_text.insert(tk.END, text)

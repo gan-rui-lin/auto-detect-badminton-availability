@@ -19,6 +19,12 @@
 pip install -r requirements.txt
 ```
 
+PowerShell 如果要带版本约束，请给参数加引号，避免 `>` 被解释为重定向：
+
+```powershell
+pip install "tkcalendar>=1.6.1"
+```
+
 ## 配置
 
 主要配置在 config.yaml：
@@ -60,19 +66,19 @@ pip install -r requirements.txt
 
 ```yaml
 notification:
-	email:
-		enabled: true
-		smtp_host: "smtp.qq.com"
-		smtp_port: 465
-		use_ssl: true
-		use_starttls: false
-		username: "你的QQ邮箱@qq.com"
-		password: "这里填SMTP授权码，不是QQ登录密码"
-		from_addr: "你的QQ邮箱@qq.com"
-		to_addrs:
-			- "接收提醒的邮箱@qq.com"
-		subject_prefix: "[场馆余量提醒]"
-		min_interval_sec: 660
+  email:
+    enabled: true
+    smtp_host: "smtp.qq.com"
+    smtp_port: 465
+    use_ssl: true
+    use_starttls: false
+    username: "你的QQ邮箱@qq.com"
+    password: "这里填SMTP授权码，不是QQ登录密码"
+    from_addr: "你的QQ邮箱@qq.com"
+    to_addrs:
+      - "接收提醒的邮箱@qq.com"
+    subject_prefix: "[场馆余量提醒]"
+    min_interval_sec: 660
 ```
 
 字段说明：
@@ -87,6 +93,7 @@ notification:
 - `min_interval_sec`: 邮件最小发送间隔，代码中会强制大于 600 秒
 
 运行时建议带上 `--email-alert`，即使命令行不带，只要 `notification.email.enabled: true` 也会生效。
+也可以在 GUI 中点击 `Test Email Config` 按钮先发测试邮件，确认 SMTP 配置可用。
 
 ## 运行
 
@@ -102,6 +109,7 @@ GUI 已支持：
 - 场馆下拉框（自动读取 `monitor.venue_code_map`，默认含 1-6 场馆）
 - 日期默认今天，并支持日历控件选择（依赖 `tkcalendar`）
 - 时间范围用开始/结束两个整数小时下拉（自动拼接为 `HH:00-HH:00`）
+- 一键测试邮箱配置（`Test Email Config`）
 - 一键启动/停止监控
 - 实时查看日志输出
 - 打开最后一次调试快照（HTML/PNG）
