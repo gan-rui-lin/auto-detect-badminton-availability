@@ -3,5 +3,7 @@ __pycache__\
 config.yaml
 xpath_candidates.json
 *.html
+page_snapshot.png
+page_snapshot.meta.json
 monitor.pid
 monitor.log

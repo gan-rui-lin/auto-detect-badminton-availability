@@ -5,9 +5,11 @@ import ctypes
 import json
 import logging
 import re
+import smtplib
 import threading
 import time
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib import error as urlerror
@@ -154,6 +156,7 @@ def _resolve_venue_keyword_from_code(cfg: Dict[str, Any], code_text: str) -> str
 def apply_runtime_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
     booking = cfg.setdefault("booking", {})
     monitor = cfg.setdefault("monitor", {})
+    notification = cfg.setdefault("notification", {})
 
     booking["sport_key"] = str(args.sport or "badminton").strip().lower()
 
@@ -190,6 +193,13 @@ def apply_runtime_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> No
             raise ValueError("--date 格式必须为 YYYY-MM-DD，例如 2026-04-14") from exc
         monitor["appointment_date"] = date_text
 
+    if bool(getattr(args, "email_alert", False)):
+        email_cfg = notification.get("email", {})
+        if not isinstance(email_cfg, dict):
+            email_cfg = {}
+            notification["email"] = email_cfg
+        email_cfg["enabled"] = True
+
 
 class ZhihuiLuojiaMonitor:
     def __init__(self, cfg: Dict[str, Any]) -> None:
@@ -197,6 +207,7 @@ class ZhihuiLuojiaMonitor:
         self.driver: webdriver.Chrome | None = None
         self.ocr = ddddocr.DdddOcr(show_ad=False) if ddddocr is not None else None
         self.last_alert_ts = 0.0
+        self.last_email_alert_ts = 0.0
         self.booked_once = False
 
     @property
@@ -828,6 +839,37 @@ fetch(url, {
         if not result.get("positives"):
             LOGGER.info("当前未发现余量")
 
+    def dump_last_page_debug_artifacts(self) -> None:
+        if not bool(self.monitor.get("dump_last_page_on_exit", True)):
+            return
+        if self.driver is None:
+            return
+
+        html_path = str(
+            self.monitor.get(
+                "last_page_snapshot_file",
+                self.monitor.get("html_snapshot_file", "page_snapshot.html"),
+            )
+        ).strip() or "page_snapshot.html"
+        screenshot_path = str(self.monitor.get("last_page_screenshot_file", "page_snapshot.png")).strip() or "page_snapshot.png"
+        meta_path = str(self.monitor.get("last_page_meta_file", "page_snapshot.meta.json")).strip() or "page_snapshot.meta.json"
+
+        try:
+            driver = self._must_driver()
+            Path(html_path).write_text(driver.page_source or "", encoding="utf-8")
+            screenshot_saved = bool(driver.save_screenshot(screenshot_path))
+            meta = {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "url": driver.current_url,
+                "html_file": html_path,
+                "screenshot_file": screenshot_path,
+                "screenshot_saved": screenshot_saved,
+            }
+            Path(meta_path).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            LOGGER.info("已保存最后页面调试快照: html=%s screenshot=%s meta=%s", html_path, screenshot_path, meta_path)
+        except Exception:
+            LOGGER.exception("保存最后页面调试快照失败")
+
     def _popup_alert(self, message: str) -> None:
         if not bool(self.notification.get("popup", True)):
             return
@@ -842,12 +884,83 @@ fetch(url, {
 
         threading.Thread(target=_show, daemon=True).start()
 
+    def _send_email_alert(self, result: Dict[str, Any], message: str) -> None:
+        email_cfg = self.notification.get("email", {})
+        if not isinstance(email_cfg, dict) or not bool(email_cfg.get("enabled", False)):
+            return
+
+        min_interval_sec = int(email_cfg.get("min_interval_sec", 660) or 660)
+        if min_interval_sec <= 600:
+            min_interval_sec = 601
+
+        now = time.time()
+        if now - self.last_email_alert_ts < min_interval_sec:
+            return
+        self.last_email_alert_ts = now
+
+        smtp_host = str(email_cfg.get("smtp_host", "")).strip()
+        smtp_port = int(email_cfg.get("smtp_port", 465) or 465)
+        use_ssl = bool(email_cfg.get("use_ssl", True))
+        use_starttls = bool(email_cfg.get("use_starttls", True))
+        username = str(email_cfg.get("username", "")).strip()
+        password = str(email_cfg.get("password", "")).strip()
+        from_addr = str(email_cfg.get("from_addr", username)).strip()
+
+        to_addrs_raw = email_cfg.get("to_addrs", [])
+        to_addrs: List[str] = []
+        if isinstance(to_addrs_raw, list):
+            to_addrs = [str(x).strip() for x in to_addrs_raw if str(x).strip()]
+        elif isinstance(to_addrs_raw, str):
+            to_addrs = [x.strip() for x in re.split(r"[,;]", to_addrs_raw) if x.strip()]
+
+        if not smtp_host or not from_addr or not to_addrs:
+            LOGGER.error("邮件通知未发送：请检查 notification.email.smtp_host/from_addr/to_addrs 配置")
+            return
+
+        subject_prefix = str(email_cfg.get("subject_prefix", "[场馆余量提醒]")).strip() or "[场馆余量提醒]"
+        subject = f"{subject_prefix} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        body_lines = [
+            message,
+            f"time={datetime.now().isoformat(timespec='seconds')}",
+            f"url={result.get('url', '')}",
+            "",
+            "详情:",
+        ]
+        for line in result.get("positives", [])[:20]:
+            body_lines.append(line)
+
+        email_msg = EmailMessage()
+        email_msg["Subject"] = subject
+        email_msg["From"] = from_addr
+        email_msg["To"] = ", ".join(to_addrs)
+        email_msg.set_content("\n".join(body_lines), charset="utf-8")
+
+        try:
+            if use_ssl:
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
+                    if username and password:
+                        server.login(username, password)
+                    server.send_message(email_msg)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+                    if use_starttls:
+                        server.starttls()
+                    if username and password:
+                        server.login(username, password)
+                    server.send_message(email_msg)
+            LOGGER.info("邮件通知已发送: %s", ",".join(to_addrs))
+        except Exception as exc:
+            LOGGER.error("邮件通知发送失败: %s", exc)
+
     def alert(self, result: Dict[str, Any]) -> None:
         msg = "检测到场馆有余量: " + " | ".join(result.get("positives", [])[:8])
 
         # For long-running monitoring, popup should be shown on every detection hit.
         if bool(self.notification.get("popup_each_hit", True)):
             self._popup_alert(msg)
+
+        # Email throttling is independent from normal alert cooldown.
+        self._send_email_alert(result, msg)
 
         cooldown = int(self.monitor.get("alert_cooldown_sec", 300))
         now = time.time()
@@ -889,10 +1002,32 @@ def run_once(monitor: ZhihuiLuojiaMonitor) -> None:
     monitor.login()
     monitor.open_reserve_page()
     monitor._log_effective_query()
-    result = monitor.check_availability()
-    monitor.log_availability(result)
-    if result.get("has_available", False):
-        monitor.alert(result)
+
+    retries = max(0, int(monitor.monitor.get("once_retries", 2)))
+    gap_sec = float(monitor.monitor.get("once_retry_gap_sec", 1.2))
+    refresh_before_retry = bool(monitor.monitor.get("once_refresh_before_retry", True))
+    total_attempts = 1 + retries
+
+    for attempt in range(1, total_attempts + 1):
+        if total_attempts > 1:
+            LOGGER.info("单次检测第 %s/%s 轮", attempt, total_attempts)
+
+        result = monitor.check_availability()
+        monitor.log_availability(result)
+        if result.get("has_available", False):
+            monitor.alert(result)
+            return
+
+        if attempt >= total_attempts:
+            break
+
+        if refresh_before_retry:
+            try:
+                monitor._must_driver().refresh()
+            except WebDriverException:
+                monitor.open_reserve_page()
+        if gap_sec > 0:
+            time.sleep(gap_sec)
 
 
 def run_loop(monitor: ZhihuiLuojiaMonitor) -> None:
@@ -926,6 +1061,7 @@ def main() -> None:
     parser.add_argument("--venue", help="场馆筛选，支持多选逗号分隔；可用编号映射或名称关键字，例如 1,3 或 风雨,竹园")
     parser.add_argument("--time-range", help="时段范围过滤，格式 HH:MM-HH:MM，例如 18:00-21:00")
     parser.add_argument("--date", help="查询日期，格式 YYYY-MM-DD，例如 2026-04-14")
+    parser.add_argument("--email-alert", action="store_true", help="检测到余量时发送邮件通知（需配置 notification.email）")
     parser.add_argument("--log-level", default="INFO", help="日志级别")
     args = parser.parse_args()
 
@@ -941,6 +1077,7 @@ def main() -> None:
         else:
             run_loop(monitor)
     finally:
+        monitor.dump_last_page_debug_artifacts()
         monitor.close()
 
 

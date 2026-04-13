@@ -48,6 +48,13 @@ monitor:
   interval_sec: 20
   refresh_each_cycle: true
   navigate_each_cycle: false
+  once_retries: 2
+  once_retry_gap_sec: 1.2
+  once_refresh_before_retry: true
+  dump_last_page_on_exit: true
+  last_page_snapshot_file: "page_snapshot.html"
+  last_page_screenshot_file: "page_snapshot.png"
+  last_page_meta_file: "page_snapshot.meta.json"
   dump_xpath_on_start: true
   xpath_dump_file: "xpath_candidates.json"
   dump_slot_debug_on_check: true
@@ -97,3 +104,15 @@ booking:
 notification:
   webhook_url: ""
   beep: true
+  email:
+    enabled: false
+    smtp_host: "smtp.example.com"
+    smtp_port: 465
+    use_ssl: true
+    use_starttls: false
+    username: ""
+    password: ""
+    from_addr: ""
+    to_addrs: []
+    subject_prefix: "[场馆余量提醒]"
+    min_interval_sec: 660

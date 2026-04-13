@@ -9,6 +9,7 @@
 - 支持命令行时间范围过滤（例如 18:00-21:00，范围内时段均可）
 - 支持命令行场馆映射多选（例如 `--venue 1,3`）
 - 支持命令行选择球类（`--sport`，默认羽毛球）
+- 支持命令行启用邮箱告警（`--email-alert`，配合 `config.yaml` 的 SMTP 配置）
 - 输出精简结果：每个场馆只出现一次
 - 支持提示音和 webhook 告警
 
@@ -27,6 +28,13 @@ pip install -r requirements.txt
 - booking.sport_type_map: 球类到 typeId 的映射
 - booking.next_day: 未指定 --date 时是否默认查次日
 - monitor.interval_sec: 轮询间隔
+- monitor.once_retries: `--once` 模式下额外重试次数（默认 2）
+- monitor.once_retry_gap_sec: `--once` 模式重试间隔秒数（默认 1.2）
+- monitor.once_refresh_before_retry: `--once` 重试前是否刷新页面
+- monitor.dump_last_page_on_exit: 退出前是否保存最后页面调试文件
+- monitor.last_page_snapshot_file: 最后页面 HTML 文件路径
+- monitor.last_page_screenshot_file: 最后页面截图文件路径
+- monitor.last_page_meta_file: 最后页面元数据 JSON 文件路径（含 URL 和时间）
 - monitor.appointment_date_offset_days: 未指定 --date 时的日期偏移
 - monitor.api_max_courts_per_venue: 每个场馆最多查询场地数
 - monitor.consistency_rounds: 每轮检测对同一场馆采样次数（建议 2）
@@ -37,6 +45,12 @@ pip install -r requirements.txt
 - notification.popup: 是否弹出顶置提醒窗口
 - notification.popup_each_hit: 有余量时每轮检测都弹窗（推荐 true）
 - notification.popup_title: 弹窗标题
+- notification.email.enabled: 是否启用邮箱（可被命令行 `--email-alert` 打开）
+- notification.email.smtp_host / smtp_port: SMTP 服务器地址与端口
+- notification.email.use_ssl / use_starttls: 邮件加密方式
+- notification.email.username / password: SMTP 登录账号密码（部分邮箱需授权码）
+- notification.email.from_addr / to_addrs: 发件人与收件人列表
+- notification.email.min_interval_sec: 邮件最小发送间隔（代码中强制 > 10 分钟）
 
 ## 运行
 
@@ -101,6 +115,12 @@ python monitor_pc.py --once --time-range 18:00-21:00 --date 2026-04-14
 python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 --date 2026-04-14
 ```
 
+组合使用（场馆 + 时间范围 + 邮箱告警）：
+
+```bash
+python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 --date 2026-04-14 --email-alert
+```
+
 羽毛球场馆编号映射（默认，可在 `monitor.venue_code_map` 自定义）：
 
 1 = 风雨体育馆
@@ -138,6 +158,13 @@ python monitor_pc.py --once --sport pingpong --venue 1 --time-range 20:00-21:00 
 2. 将 `notification.popup_each_hit` 设为 `true`
 3. 将 `monitor.consistency_rounds` 设为 `2`，减少全查时的瞬时漏报
 4. 这样每次检测到有余量都会置顶弹窗，不受冷却时间影响
+5. 如需邮件提醒，命令行加 `--email-alert`，并配置 `notification.email`（默认最小间隔 660 秒）
+
+调试建议：
+
+1. `--once` 模式如果担心瞬时漏报，可保留 `monitor.once_retries: 2`（总共检测 3 轮）
+2. 程序退出时会保存最后页面到 `page_snapshot.html`、`page_snapshot.png` 和 `page_snapshot.meta.json`
+3. 这些文件可直接用于后续 GUI 小应用联调和问题复现
 
 ## 后台启动与关闭（Windows）
 
