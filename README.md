@@ -52,6 +52,42 @@ pip install -r requirements.txt
 - notification.email.from_addr / to_addrs: 发件人与收件人列表
 - notification.email.min_interval_sec: 邮件最小发送间隔（代码中强制 > 10 分钟）
 
+### 邮箱配置（以 QQ 邮箱为例）
+
+1. 登录 QQ 邮箱网页端，开启 SMTP 服务。
+2. 在 QQ 邮箱中生成 SMTP 授权码。
+3. 修改 `config.yaml` 中 `notification.email`：
+
+```yaml
+notification:
+	email:
+		enabled: true
+		smtp_host: "smtp.qq.com"
+		smtp_port: 465
+		use_ssl: true
+		use_starttls: false
+		username: "你的QQ邮箱@qq.com"
+		password: "这里填SMTP授权码，不是QQ登录密码"
+		from_addr: "你的QQ邮箱@qq.com"
+		to_addrs:
+			- "接收提醒的邮箱@qq.com"
+		subject_prefix: "[场馆余量提醒]"
+		min_interval_sec: 660
+```
+
+字段说明：
+
+- `enabled`: 是否启用邮箱通知
+- `smtp_host` / `smtp_port`: SMTP 服务器和端口（QQ 常用 `smtp.qq.com:465`）
+- `use_ssl` / `use_starttls`: 连接加密方式（465 端口建议 SSL）
+- `username`: SMTP 登录账号，通常就是邮箱地址
+- `password`: SMTP 授权码（不是邮箱登录密码）
+- `from_addr`: 发件人地址，通常与 `username` 相同
+- `to_addrs`: 收件人数组，可填多个邮箱
+- `min_interval_sec`: 邮件最小发送间隔，代码中会强制大于 600 秒
+
+运行时建议带上 `--email-alert`，即使命令行不带，只要 `notification.email.enabled: true` 也会生效。
+
 ## 运行
 
 GUI 启动（Windows 桌面小应用原型）：
