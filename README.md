@@ -113,6 +113,7 @@ python monitor_gui.py
 
 GUI 已支持：
 
+- 现代化卡片式界面与高对比日志面板（更清晰的状态反馈）
 - 参数填写（sport / venue / time-range / date / once / email-alert）
 - 运行模式可选（`Continuous` 持续监测 / `Once` 单次检测，默认 `Continuous`）
 - 场馆多选列表（自动读取 `monitor.venue_code_map`，可同时监控多个场馆）

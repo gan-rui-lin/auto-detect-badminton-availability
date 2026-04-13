@@ -41,7 +41,8 @@ class MonitorGuiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("ZHLJ Monitor GUI")
-        self.root.geometry("1080x760")
+        self.root.geometry("1180x820")
+        self.root.minsize(1080, 760)
 
         self.proc: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -50,6 +51,7 @@ class MonitorGuiApp:
         self.monitor_script = self.workspace_dir / "monitor_pc.py"
         self.default_config = self.workspace_dir / "config.yaml"
 
+        self._configure_styles()
         self._build_form()
         self._build_log_panel()
         self._set_running(False)
@@ -58,9 +60,74 @@ class MonitorGuiApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(120, self._drain_log_queue)
 
+    def _configure_styles(self) -> None:
+        self.colors = {
+            "bg": "#f4f7f9",
+            "panel": "#ffffff",
+            "text": "#0f172a",
+            "muted": "#475569",
+            "border": "#cbd5e1",
+            "accent": "#0ea5a4",
+            "accent_dark": "#0f766e",
+            "success": "#22c55e",
+            "success_dark": "#16a34a",
+            "danger": "#ef4444",
+            "danger_dark": "#dc2626",
+        }
+
+        self.root.configure(bg=self.colors["bg"])
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("App.TFrame", background=self.colors["bg"])
+        style.configure("TFrame", background=self.colors["bg"])
+        style.configure("TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI", 10))
+        style.configure("Title.TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI Semibold", 18))
+        style.configure("SubTitle.TLabel", background=self.colors["bg"], foreground=self.colors["muted"], font=("Segoe UI", 10))
+        style.configure("Hint.TLabel", background=self.colors["bg"], foreground=self.colors["accent_dark"], font=("Segoe UI Semibold", 10))
+
+        style.configure(
+            "Card.TLabelframe",
+            background=self.colors["panel"],
+            bordercolor=self.colors["border"],
+            borderwidth=1,
+            relief="solid",
+            padding=10,
+        )
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=self.colors["bg"],
+            foreground=self.colors["text"],
+            font=("Segoe UI Semibold", 10),
+        )
+
+        style.configure("TEntry", fieldbackground=self.colors["panel"], bordercolor=self.colors["border"], padding=4)
+        style.configure("TCombobox", fieldbackground=self.colors["panel"], bordercolor=self.colors["border"], padding=3)
+        style.configure("TRadiobutton", background=self.colors["bg"], foreground=self.colors["text"])
+        style.configure("TCheckbutton", background=self.colors["bg"], foreground=self.colors["text"])
+
+        style.configure("Accent.TButton", background=self.colors["success"], foreground="#ffffff", padding=(10, 5), borderwidth=0)
+        style.map("Accent.TButton", background=[("active", self.colors["success_dark"]), ("disabled", "#94a3b8")])
+
+        style.configure("Danger.TButton", background=self.colors["danger"], foreground="#ffffff", padding=(10, 5), borderwidth=0)
+        style.map("Danger.TButton", background=[("active", self.colors["danger_dark"]), ("disabled", "#94a3b8")])
+
+        style.configure("Secondary.TButton", background=self.colors["panel"], foreground=self.colors["text"], padding=(10, 5), borderwidth=1)
+        style.map("Secondary.TButton", background=[("active", "#e2e8f0")])
+
     def _build_form(self) -> None:
-        frame = ttk.Frame(self.root, padding=12)
+        frame = ttk.Frame(self.root, style="App.TFrame", padding=(14, 12, 14, 8))
         frame.pack(fill=tk.X)
+
+        header = ttk.Frame(frame, style="App.TFrame")
+        header.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(header, text="Wuhan Gym Monitor", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Smart monitoring dashboard for venue and time-slot availability",
+            style="SubTitle.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
 
         today_text = date.today().strftime("%Y-%m-%d")
         self.sport_var = tk.StringVar(value="badminton")
@@ -74,8 +141,8 @@ class MonitorGuiApp:
         self.venue_option_items: list[tuple[str, str]] = list(self.venue_display_to_value.items())
         self.time_slot_values = [f"{h:02d}:00-{h + 1:02d}:00" for h in range(8, 21)]
 
-        row1 = ttk.Frame(frame)
-        row1.pack(fill=tk.X, pady=4)
+        row1 = ttk.LabelFrame(frame, text="Basics", style="Card.TLabelframe", padding=(12, 8))
+        row1.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(row1, text="Sport").pack(side=tk.LEFT)
         ttk.Combobox(
             row1,
@@ -91,42 +158,62 @@ class MonitorGuiApp:
             self.date_picker.pack(side=tk.LEFT, padx=(8, 4))
         else:
             ttk.Entry(row1, textvariable=self.date_var, width=14).pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Button(row1, text="Today", command=self.set_today).pack(side=tk.LEFT)
+        ttk.Button(row1, text="Today", style="Secondary.TButton", command=self.set_today).pack(side=tk.LEFT)
 
-        row2 = ttk.Frame(frame)
-        row2.pack(fill=tk.X, pady=4)
+        row2 = ttk.Frame(frame, style="App.TFrame")
+        row2.pack(fill=tk.X, pady=(0, 8))
 
-        venue_panel = ttk.Frame(row2)
+        venue_panel = ttk.LabelFrame(row2, text="Venues", style="Card.TLabelframe", padding=(10, 8))
         venue_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-        ttk.Label(venue_panel, text="Venues (multi-select)").pack(anchor="w")
+        ttk.Label(venue_panel, text="Multi-select venues to monitor", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 4))
         self.venue_listbox = tk.Listbox(venue_panel, selectmode=tk.MULTIPLE, exportselection=False, height=6)
+        self.venue_listbox.configure(
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            selectbackground=self.colors["accent_dark"],
+            selectforeground="#ffffff",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            borderwidth=0,
+            font=("Segoe UI", 10),
+        )
         self.venue_listbox.pack(fill=tk.BOTH, expand=True)
         for label, _ in self.venue_option_items:
             self.venue_listbox.insert(tk.END, label)
         self._select_all_venues()
-        venue_btns = ttk.Frame(venue_panel)
+        venue_btns = ttk.Frame(venue_panel, style="App.TFrame")
         venue_btns.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(venue_btns, text="All", command=self._select_all_venues).pack(side=tk.LEFT)
-        ttk.Button(venue_btns, text="Clear", command=self._clear_venues).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(venue_btns, text="All", style="Secondary.TButton", command=self._select_all_venues).pack(side=tk.LEFT)
+        ttk.Button(venue_btns, text="Clear", style="Secondary.TButton", command=self._clear_venues).pack(side=tk.LEFT, padx=(6, 0))
 
-        time_panel = ttk.Frame(row2)
+        time_panel = ttk.LabelFrame(row2, text="Time Slots", style="Card.TLabelframe", padding=(10, 8))
         time_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
-        ttk.Label(time_panel, text="Time Slots (multi-select, default 08:00-21:00)").pack(anchor="w")
+        ttk.Label(time_panel, text="Default selects all 08:00-21:00", style="SubTitle.TLabel").pack(anchor="w", pady=(0, 4))
         self.time_listbox = tk.Listbox(time_panel, selectmode=tk.MULTIPLE, exportselection=False, height=6)
+        self.time_listbox.configure(
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            selectbackground=self.colors["accent_dark"],
+            selectforeground="#ffffff",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            borderwidth=0,
+            font=("Segoe UI", 10),
+        )
         self.time_listbox.pack(fill=tk.BOTH, expand=True)
         for slot in self.time_slot_values:
             self.time_listbox.insert(tk.END, slot)
         self._select_all_time_slots()
-        time_btns = ttk.Frame(time_panel)
+        time_btns = ttk.Frame(time_panel, style="App.TFrame")
         time_btns.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(time_btns, text="All", command=self._select_all_time_slots).pack(side=tk.LEFT)
-        ttk.Button(time_btns, text="Clear", command=self._clear_time_slots).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(time_btns, text="All", style="Secondary.TButton", command=self._select_all_time_slots).pack(side=tk.LEFT)
+        ttk.Button(time_btns, text="Clear", style="Secondary.TButton", command=self._clear_time_slots).pack(side=tk.LEFT, padx=(6, 0))
 
-        row3 = ttk.Frame(frame)
-        row3.pack(fill=tk.X, pady=4)
+        row3 = ttk.LabelFrame(frame, text="Execution", style="Card.TLabelframe", padding=(12, 8))
+        row3.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(row3, text="Config").pack(side=tk.LEFT)
         ttk.Entry(row3, textvariable=self.config_var, width=60).pack(side=tk.LEFT, padx=(8, 8))
-        ttk.Button(row3, text="Reload Venues", command=self.reload_venue_options).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(row3, text="Reload Venues", style="Secondary.TButton", command=self.reload_venue_options).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(row3, text="Log Level").pack(side=tk.LEFT)
         ttk.Combobox(
             row3,
@@ -136,34 +223,45 @@ class MonitorGuiApp:
             state="readonly",
         ).pack(side=tk.LEFT, padx=(8, 0))
 
-        row4 = ttk.Frame(frame)
-        row4.pack(fill=tk.X, pady=4)
+        row4 = ttk.Frame(frame, style="App.TFrame")
+        row4.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(row4, text="Run Mode").pack(side=tk.LEFT)
         ttk.Radiobutton(row4, text="Continuous", variable=self.run_mode_var, value="loop").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Radiobutton(row4, text="Once", variable=self.run_mode_var, value="once").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(row4, text="Email Alert", variable=self.email_alert_var).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(row4, text="Continuous keeps checking until you press Stop", style="Hint.TLabel").pack(side=tk.LEFT, padx=(14, 0))
 
-        self.start_btn = ttk.Button(row4, text="Start", command=self.start_monitor)
+        self.start_btn = ttk.Button(row4, text="Start", style="Accent.TButton", command=self.start_monitor)
         self.start_btn.pack(side=tk.LEFT, padx=(16, 6))
-        self.stop_btn = ttk.Button(row4, text="Stop", command=self.stop_monitor)
+        self.stop_btn = ttk.Button(row4, text="Stop", style="Danger.TButton", command=self.stop_monitor)
         self.stop_btn.pack(side=tk.LEFT)
-        ttk.Button(row4, text="Test Email Config", command=self.test_email_config).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(row4, text="Test Email Config", style="Secondary.TButton", command=self.test_email_config).pack(side=tk.LEFT, padx=(12, 0))
 
-        ttk.Button(row4, text="Open Snapshot HTML", command=self.open_snapshot_html).pack(side=tk.LEFT, padx=(16, 6))
-        ttk.Button(row4, text="Open Snapshot PNG", command=self.open_snapshot_png).pack(side=tk.LEFT)
+        ttk.Button(row4, text="Open Snapshot HTML", style="Secondary.TButton", command=self.open_snapshot_html).pack(side=tk.LEFT, padx=(16, 6))
+        ttk.Button(row4, text="Open Snapshot PNG", style="Secondary.TButton", command=self.open_snapshot_png).pack(side=tk.LEFT)
 
-        row5 = ttk.Frame(frame)
-        row5.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(row5, text="Enable Startup", command=self.enable_startup).pack(side=tk.LEFT)
-        ttk.Button(row5, text="Disable Startup", command=self.disable_startup).pack(side=tk.LEFT, padx=(6, 12))
+        row5 = ttk.LabelFrame(frame, text="Startup", style="Card.TLabelframe", padding=(12, 8))
+        row5.pack(fill=tk.X, pady=(0, 2))
+        ttk.Button(row5, text="Enable Startup", style="Secondary.TButton", command=self.enable_startup).pack(side=tk.LEFT)
+        ttk.Button(row5, text="Disable Startup", style="Secondary.TButton", command=self.disable_startup).pack(side=tk.LEFT, padx=(6, 12))
         self.startup_status_var = tk.StringVar(value="Startup: unknown")
         ttk.Label(row5, textvariable=self.startup_status_var).pack(side=tk.LEFT)
 
     def _build_log_panel(self) -> None:
-        log_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        log_frame = ttk.LabelFrame(self.root, text="Live Logs", style="Card.TLabelframe", padding=(10, 8))
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=(2, 12))
 
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD, font=("Consolas", 10))
+        self.log_text = tk.Text(
+            log_frame,
+            wrap=tk.WORD,
+            font=("Consolas", 10),
+            bg="#0b1220",
+            fg="#e2e8f0",
+            insertbackground="#f8fafc",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
         y_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=y_scroll.set)
 
