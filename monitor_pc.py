@@ -470,8 +470,19 @@ class ZhihuiLuojiaMonitor:
         if not username or not password:
             raise ValueError("auth.username 或 auth.password 为空")
 
-        username_xpaths = list(self.auth.get("username_xpaths", []))
-        password_xpaths = list(self.auth.get("password_xpaths", []))
+        preferred_username_xpaths = [
+            '//input[@id="username" and contains(@class, "auth_inputdz") and contains(@class, "zhdlyhm")]',
+            '//*[@id="username"]',
+            '/html/body/div/div[2]/div[3]/div[2]/div[5]/div[2]/form/div[1]/input',
+        ]
+        preferred_password_xpaths = [
+            '//input[@id="password" and contains(@class, "auth_inputdz") and contains(@class, "zhdlmm")]',
+            '//*[@id="password"]',
+            '/html/body/div/div[2]/div[3]/div[2]/div[5]/div[2]/form/div[2]/input[1]',
+        ]
+
+        username_xpaths = preferred_username_xpaths + list(self.auth.get("username_xpaths", []))
+        password_xpaths = preferred_password_xpaths + list(self.auth.get("password_xpaths", []))
         username_xpaths.append(str(self.auth.get("username_xpath", "")).strip())
         password_xpaths.append(str(self.auth.get("password_xpath", "")).strip())
         username_xpaths.extend(
