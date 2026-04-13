@@ -6,10 +6,32 @@ import queue
 import subprocess
 import sys
 import threading
+from datetime import date
 from pathlib import Path
+from typing import Any
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
+
+try:
+    from tkcalendar import DateEntry
+except ImportError:  # pragma: no cover
+    DateEntry = None
+
+
+DEFAULT_VENUE_CODE_MAP = {
+    "1": "风雨体育馆",
+    "2": "松园体育馆",
+    "3": "竹园体育馆",
+    "4": "星湖体育馆",
+    "5": "卓尔体育馆",
+    "6": "杏林体育馆",
+}
 
 
 class MonitorGuiApp:
@@ -37,12 +59,16 @@ class MonitorGuiApp:
         frame = ttk.Frame(self.root, padding=12)
         frame.pack(fill=tk.X)
 
+        today_text = date.today().strftime("%Y-%m-%d")
         self.sport_var = tk.StringVar(value="badminton")
-        self.venue_var = tk.StringVar(value="")
-        self.time_range_var = tk.StringVar(value="")
-        self.date_var = tk.StringVar(value="")
+        self.start_hour_var = tk.StringVar(value="20")
+        self.end_hour_var = tk.StringVar(value="21")
+        self.date_var = tk.StringVar(value=today_text)
         self.config_var = tk.StringVar(value=str(self.default_config))
         self.log_level_var = tk.StringVar(value="INFO")
+        self.venue_display_to_value = self._load_venue_display_map(Path(self.config_var.get()))
+        venue_values = list(self.venue_display_to_value.keys())
+        self.venue_var = tk.StringVar(value=venue_values[0] if venue_values else "全部场馆")
 
         self.once_var = tk.BooleanVar(value=True)
         self.email_alert_var = tk.BooleanVar(value=False)
@@ -52,16 +78,27 @@ class MonitorGuiApp:
         ttk.Label(row1, text="Sport").pack(side=tk.LEFT)
         ttk.Combobox(row1, textvariable=self.sport_var, values=["badminton", "pingpong"], width=14, state="readonly").pack(side=tk.LEFT, padx=(8, 16))
         ttk.Label(row1, text="Venue").pack(side=tk.LEFT)
-        ttk.Entry(row1, textvariable=self.venue_var, width=16).pack(side=tk.LEFT, padx=(8, 16))
+        self.venue_combo = ttk.Combobox(row1, textvariable=self.venue_var, values=venue_values, width=28, state="readonly")
+        self.venue_combo.pack(side=tk.LEFT, padx=(8, 16))
         ttk.Label(row1, text="Time Range").pack(side=tk.LEFT)
-        ttk.Entry(row1, textvariable=self.time_range_var, width=16).pack(side=tk.LEFT, padx=(8, 16))
+        hour_start_values = ["不限"] + [str(h) for h in range(0, 24)]
+        hour_end_values = ["不限"] + [str(h) for h in range(1, 25)]
+        ttk.Combobox(row1, textvariable=self.start_hour_var, values=hour_start_values, width=6, state="readonly").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Label(row1, text="to").pack(side=tk.LEFT)
+        ttk.Combobox(row1, textvariable=self.end_hour_var, values=hour_end_values, width=6, state="readonly").pack(side=tk.LEFT, padx=(4, 16))
         ttk.Label(row1, text="Date").pack(side=tk.LEFT)
-        ttk.Entry(row1, textvariable=self.date_var, width=14).pack(side=tk.LEFT, padx=(8, 0))
+        if DateEntry is not None:
+            self.date_picker = DateEntry(row1, textvariable=self.date_var, date_pattern="yyyy-mm-dd", width=12)
+            self.date_picker.pack(side=tk.LEFT, padx=(8, 4))
+        else:
+            ttk.Entry(row1, textvariable=self.date_var, width=14).pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Button(row1, text="Today", command=self.set_today).pack(side=tk.LEFT)
 
         row2 = ttk.Frame(frame)
         row2.pack(fill=tk.X, pady=4)
         ttk.Label(row2, text="Config").pack(side=tk.LEFT)
-        ttk.Entry(row2, textvariable=self.config_var, width=72).pack(side=tk.LEFT, padx=(8, 16))
+        ttk.Entry(row2, textvariable=self.config_var, width=62).pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Button(row2, text="Reload Venues", command=self.reload_venue_options).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(row2, text="Log Level").pack(side=tk.LEFT)
         ttk.Combobox(row2, textvariable=self.log_level_var, values=["DEBUG", "INFO", "WARNING", "ERROR"], width=10, state="readonly").pack(side=tk.LEFT, padx=(8, 0))
 
@@ -97,6 +134,48 @@ class MonitorGuiApp:
         y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self._append_log("GUI ready. Click Start to run monitor_pc.py.\n")
+        if DateEntry is None:
+            self._append_log("Tip: install tkcalendar for graphical date picker: pip install tkcalendar\n")
+
+    def _load_venue_display_map(self, config_path: Path) -> dict[str, str]:
+        code_map: dict[str, str] = {}
+        if yaml is not None and config_path.exists():
+            try:
+                data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                monitor = data.get("monitor", {}) if isinstance(data, dict) else {}
+                configured = monitor.get("venue_code_map", {}) if isinstance(monitor, dict) else {}
+                if isinstance(configured, dict):
+                    for code, name in configured.items():
+                        code_text = str(code).strip()
+                        name_text = str(name).strip()
+                        if code_text and name_text:
+                            code_map[code_text] = name_text
+            except Exception:
+                code_map = {}
+
+        if not code_map:
+            code_map = dict(DEFAULT_VENUE_CODE_MAP)
+
+        result = {"全部场馆": ""}
+        sorted_items = sorted(code_map.items(), key=lambda x: (not str(x[0]).isdigit(), int(x[0]) if str(x[0]).isdigit() else 9999, str(x[0])))
+        for code, name in sorted_items:
+            result[f"{code} - {name}"] = code
+        return result
+
+    def reload_venue_options(self) -> None:
+        cfg_text = self.config_var.get().strip() or str(self.default_config)
+        self.venue_display_to_value = self._load_venue_display_map(Path(cfg_text))
+        venue_values = list(self.venue_display_to_value.keys())
+        self.venue_combo.configure(values=venue_values)
+
+        current = self.venue_var.get().strip()
+        if current not in self.venue_display_to_value:
+            self.venue_var.set(venue_values[0] if venue_values else "")
+
+        self._append_log("Venue options reloaded from config.\n")
+
+    def set_today(self) -> None:
+        self.date_var.set(date.today().strftime("%Y-%m-%d"))
 
     def _append_log(self, text: str) -> None:
         self.log_text.insert(tk.END, text)
@@ -117,13 +196,27 @@ class MonitorGuiApp:
         sport = self.sport_var.get().strip() or "badminton"
         cmd.extend(["--sport", sport])
 
-        venue = self.venue_var.get().strip()
+        venue_key = self.venue_var.get().strip()
+        venue = self.venue_display_to_value.get(venue_key, "")
         if venue:
             cmd.extend(["--venue", venue])
 
-        time_range = self.time_range_var.get().strip()
-        if time_range:
-            cmd.extend(["--time-range", time_range])
+        start_txt = self.start_hour_var.get().strip()
+        end_txt = self.end_hour_var.get().strip()
+        unlimited = "不限"
+        if start_txt == unlimited and end_txt == unlimited:
+            pass
+        elif start_txt != unlimited and end_txt != unlimited:
+            try:
+                start_hour = int(start_txt)
+                end_hour = int(end_txt)
+            except ValueError as exc:
+                raise ValueError("Time Range must be integer hours.") from exc
+            if not (0 <= start_hour <= 23 and 1 <= end_hour <= 24 and start_hour < end_hour):
+                raise ValueError("Time Range requires start < end, start in [0,23], end in [1,24].")
+            cmd.extend(["--time-range", f"{start_hour:02d}:00-{end_hour:02d}:00"])
+        else:
+            raise ValueError("Please choose both start and end hours, or both set to 不限.")
 
         date_text = self.date_var.get().strip()
         if date_text:
@@ -155,7 +248,11 @@ class MonitorGuiApp:
             messagebox.showerror("Missing File", f"File not found: {self.monitor_script}")
             return
 
-        cmd = self._build_command()
+        try:
+            cmd = self._build_command()
+        except ValueError as exc:
+            messagebox.showerror("Invalid Parameters", str(exc))
+            return
         self._append_log("\n=== START ===\n")
         self._append_log("Command: " + " ".join(cmd) + "\n")
 

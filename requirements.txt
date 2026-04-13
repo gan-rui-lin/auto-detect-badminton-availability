@@ -1,3 +1,4 @@
 selenium>=4.20.0
 PyYAML>=6.0.2
 ddddocr>=1.5.6
+tkcalendar>=1.6.1

@@ -63,6 +63,9 @@ python monitor_gui.py
 GUI 已支持：
 
 - 参数填写（sport / venue / time-range / date / once / email-alert）
+- 场馆下拉框（自动读取 `monitor.venue_code_map`，默认含 1-6 场馆）
+- 日期默认今天，并支持日历控件选择（依赖 `tkcalendar`）
+- 时间范围用开始/结束两个整数小时下拉（自动拼接为 `HH:00-HH:00`）
 - 一键启动/停止监控
 - 实时查看日志输出
 - 打开最后一次调试快照（HTML/PNG）
