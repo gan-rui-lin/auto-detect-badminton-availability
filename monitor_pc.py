@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import re
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib import error as urlerror
@@ -14,16 +16,10 @@ from urllib import request as urlrequest
 try:
     import yaml
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "缺少 PyYAML 依赖。请先执行: python -m pip install -r requirements.txt"
-    ) from exc
+    raise SystemExit("缺少 PyYAML 依赖。请先执行: python -m pip install -r requirements.txt") from exc
+
 from selenium import webdriver
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    InvalidSelectorException,
-    TimeoutException,
-    WebDriverException,
-)
+from selenium.common.exceptions import InvalidSessionIdException, TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -39,11 +35,18 @@ try:
 except ImportError:  # pragma: no cover
     winsound = None
 
-
 LOGGER = logging.getLogger("zhlj-monitor")
 SPORT_TYPE_MAP = {
     "badminton": 21,
     "pingpong": 22,
+}
+DEFAULT_VENUE_CODE_MAP = {
+    "1": "风雨体育馆",
+    "2": "松园体育馆",
+    "3": "竹园体育馆",
+    "4": "星湖体育馆",
+    "5": "卓尔体育馆",
+    "6": "杏林体育馆",
 }
 
 
@@ -64,18 +67,128 @@ def load_config(path: Path) -> Dict[str, Any]:
 
 
 def normalize_text(text: str) -> str:
-    return " ".join(text.split())
+    return " ".join(str(text or "").split())
 
 
-def contains_any(text: str, keywords: List[str]) -> bool:
-    return any(k in text for k in keywords)
+def build_period_label_map(monitor_cfg: Dict[str, Any]) -> Dict[int, str]:
+    configured = monitor_cfg.get("period_labels", {})
+    if isinstance(configured, dict) and configured:
+        parsed: Dict[int, str] = {}
+        for key, value in configured.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            label = str(value).strip()
+            if idx > 0 and label:
+                parsed[idx] = label
+        if parsed:
+            return parsed
+
+    start_hour = int(monitor_cfg.get("period_start_hour", 8))
+    return {i: f"{start_hour + i - 1:02d}:00-{start_hour + i:02d}:00" for i in range(1, 14)}
 
 
-def parse_rgb(rgb_text: str) -> tuple[int, int, int]:
-    match = re.search(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", rgb_text or "")
-    if not match:
-        return (0, 0, 0)
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+def parse_periods_arg(periods_arg: str, monitor_cfg: Dict[str, Any]) -> List[int]:
+    period_map = build_period_label_map(monitor_cfg)
+    label_to_index = {v.replace(" ", ""): k for k, v in period_map.items()}
+
+    raw_tokens = [x.strip() for x in periods_arg.split(",") if x.strip()]
+    if not raw_tokens:
+        raise ValueError("--periods 不能为空，例如 --periods 10,11 或 --periods 19:00-20:00")
+
+    result: List[int] = []
+    for token in raw_tokens:
+        if token.isdigit():
+            idx = int(token)
+        else:
+            idx = label_to_index.get(token.replace(" ", ""), 0)
+        if idx <= 0:
+            raise ValueError(
+                f"无法识别时段参数: {token}。请使用时段索引(如 10,11)或时间段(如 19:00-20:00)"
+            )
+        result.append(idx)
+
+    deduped: List[int] = []
+    seen = set()
+    for idx in result:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        deduped.append(idx)
+    return deduped
+
+
+def parse_time_range(range_text: str) -> tuple[str, str]:
+    text = str(range_text or "").strip()
+    m = re.match(r"^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$", text)
+    if not m:
+        raise ValueError("--time-range 格式必须为 HH:MM-HH:MM，例如 18:00-21:00")
+    start = m.group(1).zfill(5)
+    end = m.group(2).zfill(5)
+    if start >= end:
+        raise ValueError("--time-range 起始时间必须早于结束时间")
+    return start, end
+
+
+def _resolve_venue_keyword_from_code(cfg: Dict[str, Any], code_text: str) -> str:
+    monitor = cfg.setdefault("monitor", {})
+    configured = monitor.get("venue_code_map", {})
+    code_map: Dict[str, str] = {}
+    if isinstance(configured, dict):
+        for k, v in configured.items():
+            key = str(k).strip()
+            val = str(v).strip()
+            if key and val:
+                code_map[key] = val
+    if not code_map:
+        code_map = dict(DEFAULT_VENUE_CODE_MAP)
+
+    venue_keyword = code_map.get(code_text, "").strip()
+    if not venue_keyword:
+        allowed = ", ".join(sorted(code_map.keys()))
+        raise ValueError(f"--venue 不在映射中，当前可用编号: {allowed}")
+    return venue_keyword
+
+
+def apply_runtime_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
+    booking = cfg.setdefault("booking", {})
+    monitor = cfg.setdefault("monitor", {})
+
+    booking["sport_key"] = str(args.sport or "badminton").strip().lower()
+
+    if args.venue:
+        raw_tokens = [x.strip() for x in str(args.venue).split(",") if x.strip()]
+        if not raw_tokens:
+            raise ValueError("--venue 不能为空，例如 --venue 1,3 或 --venue 风雨,竹园")
+        filters: List[str] = []
+        for token in raw_tokens:
+            if token.isdigit():
+                filters.append(_resolve_venue_keyword_from_code(cfg, token))
+            else:
+                filters.append(token)
+        # De-duplicate while preserving order.
+        dedup: List[str] = []
+        seen = set()
+        for f in filters:
+            key = normalize_text(f).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(f)
+        monitor["venue_name_filters"] = dedup
+
+    if args.time_range:
+        start, end = parse_time_range(args.time_range)
+        monitor["time_range"] = f"{start}-{end}"
+
+    if args.date:
+        date_text = str(args.date).strip()
+        try:
+            datetime.strptime(date_text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("--date 格式必须为 YYYY-MM-DD，例如 2026-04-14") from exc
+        monitor["appointment_date"] = date_text
 
 
 class ZhihuiLuojiaMonitor:
@@ -85,7 +198,6 @@ class ZhihuiLuojiaMonitor:
         self.ocr = ddddocr.DdddOcr(show_ad=False) if ddddocr is not None else None
         self.last_alert_ts = 0.0
         self.booked_once = False
-        self.structured_warned = False
 
     @property
     def browser(self) -> Dict[str, Any]:
@@ -102,10 +214,6 @@ class ZhihuiLuojiaMonitor:
     @property
     def captcha(self) -> Dict[str, Any]:
         return self.cfg.get("captcha", {})
-
-    @property
-    def navigation(self) -> Dict[str, Any]:
-        return self.cfg.get("navigation", {})
 
     @property
     def monitor(self) -> Dict[str, Any]:
@@ -128,11 +236,11 @@ class ZhihuiLuojiaMonitor:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
 
-        user_agent = self.browser.get("user_agent", "").strip()
+        user_agent = str(self.browser.get("user_agent", "")).strip()
         if user_agent:
             options.add_argument(f"user-agent={user_agent}")
 
-        user_data_dir = self.browser.get("user_data_dir", "").strip()
+        user_data_dir = str(self.browser.get("user_data_dir", "")).strip()
         if user_data_dir:
             options.add_argument(f"--user-data-dir={user_data_dir}")
 
@@ -149,18 +257,6 @@ class ZhihuiLuojiaMonitor:
         if self.driver is None:
             raise RuntimeError("浏览器尚未启动")
         return self.driver
-
-    def _wait_present(self, xpath: str, timeout: int) -> Any:
-        driver = self._must_driver()
-        return WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.XPATH, xpath))
-        )
-
-    def _wait_clickable(self, xpath: str, timeout: int) -> Any:
-        driver = self._must_driver()
-        return WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, xpath))
-        )
 
     def _find_visible_element(self, xpath: str) -> Any | None:
         driver = self._must_driver()
@@ -181,14 +277,13 @@ class ZhihuiLuojiaMonitor:
 
     def _submit_login(self) -> None:
         driver = self._must_driver()
-        configured = self.auth.get("submit_xpaths", [])
         submit_xpaths: List[str] = []
+        configured = self.auth.get("submit_xpaths", [])
         if isinstance(configured, list):
             submit_xpaths.extend(str(x).strip() for x in configured if str(x).strip())
         submit_xpath = str(self.auth.get("submit_xpath", "")).strip()
         if submit_xpath:
             submit_xpaths.append(submit_xpath)
-
         submit_xpaths.extend(
             [
                 '//*[@id="login_submit"]',
@@ -200,27 +295,22 @@ class ZhihuiLuojiaMonitor:
         )
 
         seen = set()
-        deduped = []
-        for item in submit_xpaths:
-            if item not in seen:
-                seen.add(item)
-                deduped.append(item)
-
-        for xpath in deduped:
+        for xpath in submit_xpaths:
+            if not xpath or xpath in seen:
+                continue
+            seen.add(xpath)
             try:
                 element = self._find_visible_element(xpath)
                 if element is None:
                     continue
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center',inline:'nearest'});", element
-                )
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
                 try:
                     element.click()
                 except WebDriverException:
                     driver.execute_script("arguments[0].click();", element)
                 LOGGER.info("已点击提交按钮: %s", xpath)
                 return
-            except (InvalidSelectorException, WebDriverException):
+            except WebDriverException:
                 continue
 
         password_candidates = list(self.auth.get("password_xpaths", []))
@@ -238,38 +328,83 @@ class ZhihuiLuojiaMonitor:
             LOGGER.info("提交按钮未命中，已使用回车提交")
             return
 
-        raise TimeoutException("未找到可提交登录的按钮或输入框")
-
-    def _log_login_state(self) -> None:
-        driver = self._must_driver()
-        LOGGER.warning("当前 URL: %s", driver.current_url)
-        LOGGER.warning("当前标题: %s", driver.title)
-        script = """
-const nodes = [...document.querySelectorAll('button,input[type="submit"],a')].slice(0, 20);
-return nodes.map((n) => ({
-  tag: n.tagName.toLowerCase(),
-  text: (n.innerText || n.value || '').trim().slice(0, 40),
-  id: (n.id || '').toString().slice(0, 60),
-  cls: (n.className || '').toString().slice(0, 80),
-  type: (n.getAttribute('type') || '').toString().slice(0, 20),
-}));
-"""
-        try:
-            items = driver.execute_script(script)
-            LOGGER.warning("页面可交互候选: %s", json.dumps(items, ensure_ascii=False))
-        except WebDriverException:
-            LOGGER.warning("无法读取页面候选按钮信息")
+        raise TimeoutException("未找到可提交登录的按钮")
 
     def _is_login_success(self, success_xpath: str, success_url_contains: str) -> bool:
         driver = self._must_driver()
         if success_url_contains and success_url_contains in driver.current_url:
             return True
-        if not success_xpath:
-            return False
-        try:
-            return len(driver.find_elements(By.XPATH, success_xpath)) > 0
-        except InvalidSelectorException:
-            return False
+
+        if success_xpath:
+            try:
+                if len(driver.find_elements(By.XPATH, success_xpath)) > 0:
+                    return True
+            except WebDriverException:
+                pass
+
+        extra_url_markers = ["/pc/index", "/mobile/homepage", "/mobile/home"]
+        if any(marker in driver.current_url for marker in extra_url_markers):
+            return True
+
+        text_markers_cfg = self.auth.get(
+            "login_success_text_keywords",
+            ["退出登录", "账号管理", "个人数据中心", "应用中心", "办事大厅"],
+        )
+        text_markers = [str(x).strip() for x in text_markers_cfg if str(x).strip()]
+        if text_markers:
+            try:
+                text = normalize_text(str(driver.execute_script("return document.body ? (document.body.innerText || '') : '';")))
+                if any(marker in text for marker in text_markers):
+                    return True
+            except WebDriverException:
+                pass
+
+        return False
+
+    def _fill_captcha_if_needed(self) -> None:
+        if not bool(self.captcha.get("enabled", True)):
+            return
+
+        input_xpath = str(self.captcha.get("input_xpath", "")).strip()
+        image_xpath = str(self.captcha.get("image_xpath", "")).strip()
+        refresh_xpath = str(self.captcha.get("refresh_xpath", image_xpath)).strip()
+        if not input_xpath or not image_xpath:
+            return
+
+        captcha_input = self._find_visible_element(input_xpath)
+        captcha_image = self._find_visible_element(image_xpath)
+        if captcha_input is None or captcha_image is None:
+            return
+
+        if self.ocr is None:
+            raise RuntimeError("检测到验证码，但未安装 ddddocr。请先执行: pip install -r requirements.txt")
+
+        max_attempts = int(self.captcha.get("max_attempts_per_login", 3))
+        for i in range(1, max_attempts + 1):
+            captcha_image = self._find_visible_element(image_xpath)
+            if captcha_image is None:
+                return
+
+            image_bytes = captcha_image.screenshot_as_png
+            guess = self.ocr.classification(image_bytes).strip()
+            guess = "".join(ch for ch in guess if ch.isalnum())
+            if not guess:
+                LOGGER.warning("验证码识别为空，第 %s 次重试", i)
+                refresh_element = self._find_visible_element(refresh_xpath)
+                if refresh_element is not None:
+                    refresh_element.click()
+                time.sleep(0.3)
+                continue
+
+            captcha_input = self._find_visible_element(input_xpath)
+            if captcha_input is None:
+                return
+            captcha_input.clear()
+            captcha_input.send_keys(guess)
+            LOGGER.info("验证码识别结果: %s", guess)
+            return
+
+        raise RuntimeError("验证码识别失败：达到最大重试次数")
 
     def _resolve_type_id(self) -> int:
         type_map = dict(SPORT_TYPE_MAP)
@@ -281,9 +416,7 @@ return nodes.map((n) => ({
         sport_key = str(self.booking.get("sport_key", "")).strip()
         if sport_key:
             if sport_key not in type_map:
-                raise ValueError(
-                    f"booking.sport_key={sport_key} 未在 sport_type_map 中定义，可修改源码 SPORT_TYPE_MAP 或配置 booking.sport_type_map"
-                )
+                raise ValueError(f"booking.sport_key={sport_key} 未在 sport_type_map 中定义")
             return int(type_map[sport_key])
         return int(self.portal.get("type_id", 21))
 
@@ -321,25 +454,19 @@ return nodes.map((n) => ({
             ]
         )
 
-        username_xpaths = [x for x in username_xpaths if x]
-        password_xpaths = [x for x in password_xpaths if x]
-
         for attempt in range(1, max_login_attempts + 1):
             LOGGER.info("登录尝试 %s/%s", attempt, max_login_attempts)
             driver.get(login_url)
             try:
-                WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
+                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
                 if self._is_login_success(success_xpath, success_url_contains):
                     LOGGER.info("已处于登录态，跳过登录表单")
                     return
 
-                username_el = self._find_first_visible(username_xpaths)
-                password_el = self._find_first_visible(password_xpaths)
+                username_el = self._find_first_visible([x for x in username_xpaths if x])
+                password_el = self._find_first_visible([x for x in password_xpaths if x])
                 if username_el is None or password_el is None:
                     LOGGER.warning("未命中登录输入框，准备重试")
-                    self._log_login_state()
                     continue
 
                 username_el.clear()
@@ -355,268 +482,120 @@ return nodes.map((n) => ({
                 )
                 LOGGER.info("登录成功")
                 return
+            except InvalidSessionIdException:
+                LOGGER.warning("浏览器会话中断，正在重建浏览器后重试")
+                try:
+                    self.close()
+                except WebDriverException:
+                    pass
+                self.start()
             except (TimeoutException, WebDriverException):
                 LOGGER.warning("登录未成功，准备重试")
-                self._log_login_state()
 
         raise RuntimeError("登录失败：超过最大重试次数")
 
-    def _fill_captcha_if_needed(self) -> None:
-        if not bool(self.captcha.get("enabled", True)):
-            return
-
-        input_xpath = str(self.captcha.get("input_xpath", "")).strip()
-        image_xpath = str(self.captcha.get("image_xpath", "")).strip()
-        refresh_xpath = str(self.captcha.get("refresh_xpath", image_xpath)).strip()
-
-        if not input_xpath or not image_xpath:
-            return
-
-        captcha_input = self._find_visible_element(input_xpath)
-        captcha_image = self._find_visible_element(image_xpath)
-        if captcha_input is None or captcha_image is None:
-            return
-
-        if self.ocr is None:
-            raise RuntimeError(
-                "检测到验证码，但未安装 ddddocr。请先执行: pip install -r requirements.txt"
-            )
-
-        max_attempts = int(self.captcha.get("max_attempts_per_login", 3))
-        for i in range(1, max_attempts + 1):
-            captcha_image = self._find_visible_element(image_xpath)
-            if captcha_image is None:
-                return
-
-            image_bytes = captcha_image.screenshot_as_png
-            guess = self.ocr.classification(image_bytes).strip()
-            guess = "".join(ch for ch in guess if ch.isalnum())
-            if not guess:
-                LOGGER.warning("验证码识别为空，第 %s 次重试", i)
-                refresh_element = self._find_visible_element(refresh_xpath)
-                if refresh_element is not None:
-                    refresh_element.click()
-                time.sleep(0.3)
-                continue
-
-            captcha_input = self._find_visible_element(input_xpath)
-            if captcha_input is None:
-                return
-            captcha_input.clear()
-            captcha_input.send_keys(guess)
-            LOGGER.info("验证码识别结果: %s", guess)
-            return
-
-        raise RuntimeError("验证码识别失败：达到最大重试次数")
-
     def open_reserve_page(self) -> None:
         driver = self._must_driver()
-        reserve_url = self.portal["reserve_url_template"].format(
-            type_id=self._resolve_type_id()
-        )
+        reserve_url = self.portal["reserve_url_template"].format(type_id=self._resolve_type_id())
         driver.get(reserve_url)
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-        for xpath in self.navigation.get("click_xpaths", []):
-            if not xpath:
-                continue
-            try:
-                self._wait_clickable(xpath, 8).click()
-                time.sleep(0.4)
-            except TimeoutException:
-                LOGGER.warning("导航点击失败，跳过 xpath=%s", xpath)
+    def _is_reserve_page(self) -> bool:
+        return "/pages/index/reserve" in self._must_driver().current_url
 
-    def _wait_booking_mask_clear(self) -> None:
-        mask_xpath = str(
-            self.booking.get(
-                "mask_xpath",
-                '//uni-view[contains(@class,"mask") and contains(@class,"zindex")]',
-            )
-        ).strip()
-        if not mask_xpath:
+    def _ensure_reserve_page(self) -> None:
+        if self._is_reserve_page():
             return
-        driver = self._must_driver()
-        try:
-            WebDriverWait(driver, int(self.booking.get("mask_timeout_sec", 6))).until(
-                EC.invisibility_of_element_located((By.XPATH, mask_xpath))
+        self.open_reserve_page()
+
+    def _appointment_date_str(self) -> str:
+        explicit = str(self.monitor.get("appointment_date", "")).strip()
+        if explicit:
+            return explicit
+        offset = int(
+            self.monitor.get(
+                "appointment_date_offset_days",
+                1 if bool(self.booking.get("next_day", False)) else 0,
             )
-        except TimeoutException:
-            pass
+        )
+        return (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
 
-    def _click_booking_xpath(self, xpath: str, label: str, timeout: int = 8) -> None:
+    def _log_effective_query(self) -> None:
+        sport = str(self.booking.get("sport_key", "")).strip() or "badminton"
+        date_str = self._appointment_date_str()
+        raw_filters = self.monitor.get("venue_name_filters", [])
+        venue_filters: List[str] = []
+        if isinstance(raw_filters, list):
+            venue_filters = [normalize_text(str(x)) for x in raw_filters if normalize_text(str(x))]
+        if not venue_filters:
+            single = normalize_text(str(self.monitor.get("venue_name_filter", "")))
+            if single:
+                venue_filters = [single]
+        time_range = normalize_text(str(self.monitor.get("time_range", ""))) or "全时段"
+        venue_text = ",".join(venue_filters) if venue_filters else "全部场馆"
+        LOGGER.info("查询参数: sport=%s date=%s venue=%s time_range=%s", sport, date_str, venue_text, time_range)
+
+    def _api_fetch_json(self, url: str) -> Dict[str, Any]:
         driver = self._must_driver()
-        last_error: Exception | None = None
-        for _ in range(3):
-            self._wait_booking_mask_clear()
-            try:
-                element = self._wait_clickable(xpath, timeout)
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center',inline:'nearest'});", element
-                )
-                try:
-                    element.click()
-                except ElementClickInterceptedException:
-                    self._wait_booking_mask_clear()
-                    driver.execute_script("arguments[0].click();", element)
-                return
-            except (TimeoutException, WebDriverException) as exc:
-                last_error = exc
-                time.sleep(0.35)
-        raise RuntimeError(f"{label} 点击失败: {xpath}") from last_error
+        script = r"""
+const done = arguments[arguments.length - 1];
+const url = arguments[0];
 
-    def try_book(self) -> bool:
-        if not bool(self.booking.get("enabled", False)):
-            return False
-        if self.booked_once and bool(self.booking.get("book_once", True)):
-            LOGGER.info("已完成一次预约，按配置不再重复预约")
-            return False
-
-        next_day = bool(self.booking.get("next_day", False))
-        next_day_xpath = str(self.booking.get("next_day_xpath", "")).strip()
-        venue_xpath = str(self.booking.get("venue_xpath", "")).strip()
-        court_number = int(self.booking.get("court_number", 0))
-        court_offset = int(self.booking.get("court_row_offset", 1))
-        period_indexes = self.booking.get("period_indexes", [])
-        period_xpath_template = str(self.booking.get("period_xpath_template", "")).strip()
-        court_xpath_template = str(self.booking.get("court_xpath_template", "")).strip()
-        submit_order_xpath = str(self.booking.get("submit_order_xpath", "")).strip()
-        step_wait = float(self.booking.get("step_wait_sec", 0.4))
-
-        driver = self._must_driver()
-        try:
-            if next_day and next_day_xpath:
-                self._click_booking_xpath(next_day_xpath, "后一天")
-                time.sleep(step_wait)
-
-            if venue_xpath:
-                self._click_booking_xpath(venue_xpath, "场馆")
-                time.sleep(step_wait)
-
-            if court_number > 0 and court_xpath_template:
-                court_xpath = court_xpath_template.format(court_row_index=court_number + court_offset)
-                self._click_booking_xpath(court_xpath, "场地")
-                time.sleep(step_wait)
-
-            if isinstance(period_indexes, list) and period_xpath_template:
-                for period in period_indexes:
-                    period_xpath = period_xpath_template.format(period_index=int(period))
-                    self._click_booking_xpath(period_xpath, f"时段{period}")
-                    time.sleep(0.2)
-
-            if submit_order_xpath:
-                self._click_booking_xpath(submit_order_xpath, "提交预约")
-                LOGGER.warning("已执行预约提交流程，请立即确认页面结果")
-            else:
-                LOGGER.warning("未配置 submit_order_xpath，已完成预约前步骤但未点击最终提交")
-
-            self.booked_once = True
-            return True
-        except RuntimeError:
-            LOGGER.error("预约失败：关键节点未找到，请检查 booking 下的 XPath 配置")
-            LOGGER.error("当前页面 URL: %s", driver.current_url)
-            return False
-
-    def _discover_keyword_nodes(self, keywords: List[str]) -> List[Dict[str, str]]:
-        driver = self._must_driver()
-        script = """
-const keywords = arguments[0];
-function xpathFor(el) {
-  if (el.id) return '//*[@id="' + el.id + '"]';
-  const parts = [];
-  while (el && el.nodeType === 1) {
-    let ix = 1;
-    let sib = el.previousElementSibling;
-    while (sib) {
-      if (sib.tagName === el.tagName) ix += 1;
-      sib = sib.previousElementSibling;
-    }
-    parts.unshift(el.tagName.toLowerCase() + '[' + ix + ']');
-    el = el.parentElement;
-  }
-  return '/' + parts.join('/');
-}
-const result = [];
-const nodes = document.querySelectorAll('*');
-for (const el of nodes) {
-  const text = (el.innerText || el.textContent || '').trim();
-  if (!text || text.length > 40) continue;
-  for (const kw of keywords) {
-    if (text.includes(kw)) {
-      result.push({
-        keyword: kw,
-        text: text.replace(/\\s+/g, ' '),
-        xpath: xpathFor(el),
-        className: (el.className || '').toString().slice(0, 120),
-      });
-      break;
+function findJwt() {
+  const jwtRe = /^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/;
+  const stores = [window.localStorage, window.sessionStorage];
+  for (const st of stores) {
+    if (!st) continue;
+    for (let i = 0; i < st.length; i++) {
+      const k = st.key(i);
+      const v = st.getItem(k) || '';
+      if (jwtRe.test(v)) return v;
+      try {
+        const obj = JSON.parse(v);
+        if (!obj || typeof obj !== 'object') continue;
+        for (const key of Object.keys(obj)) {
+          const val = String(obj[key] || '');
+          if (jwtRe.test(val)) return val;
+        }
+      } catch (_) {}
     }
   }
+  return '';
 }
-return result.slice(0, 600);
+
+const token = findJwt();
+const headers = { 'Accept': '*/*', 'Content-Type': 'application/json' };
+if (token) headers['Authorization'] = 'Bearer ' + token;
+
+fetch(url, {
+  method: 'GET',
+  credentials: 'include',
+  headers,
+}).then(async (resp) => {
+  const text = await resp.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch (_) {}
+  done({ ok: resp.ok, status: resp.status, data, bodyText: text.slice(0, 300) });
+}).catch((err) => {
+  done({ ok: false, status: 0, error: String(err || '') });
+});
 """
-        raw = driver.execute_script(script, keywords)
-        if isinstance(raw, list):
-            return [r for r in raw if isinstance(r, dict)]
-        return []
-
-    def _slot_meta(self, element: Any) -> Dict[str, Any]:
-        driver = self._must_driver()
-        script = """
-const e = arguments[0];
-const s = getComputedStyle(e);
-return {
-  text: (e.innerText || e.textContent || '').trim(),
-  cls: (e.className || '').toString(),
-  pointer: (s.pointerEvents || '').toString(),
-  opacity: (s.opacity || '').toString(),
-  bg: (s.backgroundColor || '').toString(),
-  color: (s.color || '').toString(),
-  disabled: !!e.disabled,
-};
-"""
-        result = driver.execute_script(script, element)
-        if isinstance(result, dict):
-            return result
-        return {}
-
-    def _is_slot_available(self, meta: Dict[str, Any]) -> bool:
-        text = normalize_text(str(meta.get("text", "")))
-        cls = str(meta.get("cls", ""))
-        pointer = str(meta.get("pointer", ""))
-        opacity = str(meta.get("opacity", "1"))
-        disabled = bool(meta.get("disabled", False))
-        bg = str(meta.get("bg", ""))
-        blob = f"{text} {cls}".lower()
-
-        unavailable_keywords = [str(x).lower() for x in self.monitor.get("unavailable_keywords", [])]
-        available_keywords = [str(x).lower() for x in self.monitor.get("available_keywords", [])]
-        unavailable_class_keywords = [
-            str(x).lower()
-            for x in self.monitor.get("unavailable_class_keywords", ["disabled", "gray", "grey", "full", "ban"])
-        ]
-        available_class_keywords = [
-            str(x).lower()
-            for x in self.monitor.get("available_class_keywords", ["available", "green", "active"])
-        ]
-
-        if any(k in blob for k in unavailable_keywords) or any(k in blob for k in unavailable_class_keywords):
-            return False
-        if any(k in blob for k in available_keywords) or any(k in blob for k in available_class_keywords):
-            return True
-        if disabled or pointer == "none":
-            return False
         try:
-            if float(opacity) < 0.45:
-                return False
-        except ValueError:
-            pass
+            raw = driver.execute_async_script(script, url)
+        except WebDriverException:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        data = raw.get("data")
+        return data if isinstance(data, dict) else {}
 
-        r, g, b = parse_rgb(bg)
-        if g > r + 18 and g > b + 18:
-            return True
-        return False
+    def _period_index_from_label(self, time_label: str) -> int:
+        normalized = str(time_label).replace(" ", "")
+        period_map = build_period_label_map(self.monitor)
+        for index, label in period_map.items():
+            if str(label).replace(" ", "") == normalized:
+                return int(index)
+        return 0
 
     def _segment_name(self, period_index: int) -> str:
         segments = self.monitor.get(
@@ -628,213 +607,258 @@ return {
                 return name
         return "other"
 
-    def _segment_count_from_text(self, text: str) -> Dict[str, int]:
-        normalized = normalize_text(text)
-        labels = {"上午": "morning", "下午": "afternoon", "晚上": "evening"}
-        result: Dict[str, int] = {}
-        for zh, key in labels.items():
-            match = re.search(rf"{zh}\s*[：:]\s*([有无满]|可约|约满|\d+)", normalized)
-            if not match:
-                continue
-            value = match.group(1)
-            if value.isdigit():
-                result[key] = int(value)
-            elif value in ("有", "可约"):
-                result[key] = 1
-            else:
-                result[key] = 0
-        return result
+    def _segment_name_from_time_label(self, time_label: str) -> str:
+        match = re.search(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", str(time_label))
+        if not match:
+            return "other"
+        start_hour = int(match.group(1))
+        if start_hour < 12:
+            return "morning"
+        if start_hour < 18:
+            return "afternoon"
+        return "evening"
 
-    def _structured_availability(self) -> List[Dict[str, Any]]:
-        driver = self._must_driver()
-        venue_template = str(self.monitor.get("venue_xpath_template", "")).strip()
-        period_template = str(
-            self.monitor.get("period_xpath_template", self.booking.get("period_xpath_template", ""))
-        ).strip()
-        period_indexes = self.monitor.get("period_indexes", list(range(1, 14)))
-        max_venues = int(self.monitor.get("max_venues", 6))
-        analysis_wait_sec = float(self.monitor.get("analysis_wait_sec", 0.25))
-        court_number = int(self.booking.get("court_number", 0))
-        court_offset = int(self.booking.get("court_row_offset", 1))
-        court_template = str(self.booking.get("court_xpath_template", "")).strip()
+    def _duration_minutes(self, start_hm: str, end_hm: str) -> int:
+        sh, sm = [int(x) for x in start_hm.split(":")]
+        eh, em = [int(x) for x in end_hm.split(":")]
+        return (eh * 60 + em) - (sh * 60 + sm)
 
-        if not venue_template or not period_template:
+    def _in_time_range(self, start_hm: str, end_hm: str) -> bool:
+        raw = str(self.monitor.get("time_range", "")).strip()
+        if not raw:
+            return True
+        try:
+            range_start, range_end = parse_time_range(raw)
+        except ValueError:
+            return True
+        return start_hm >= range_start and end_hm <= range_end
+
+    def _venue_name_matched(self, venue_name: str) -> bool:
+        raw = self.monitor.get("venue_name_filters", [])
+        kws: List[str] = []
+        if isinstance(raw, list):
+            kws = [normalize_text(str(x)).lower() for x in raw if normalize_text(str(x))]
+        if not kws:
+            # Backward compatibility for older config keys.
+            single = normalize_text(str(self.monitor.get("venue_name_filter", ""))).lower()
+            if single:
+                kws = [single]
+
+        if not kws:
+            return True
+        hay = normalize_text(venue_name).lower()
+        return any(kw in hay for kw in kws)
+
+    def _structured_availability_via_api(self) -> List[Dict[str, Any]]:
+        type_id = self._resolve_type_id()
+        date_str = self._appointment_date_str()
+        consistency_rounds = max(1, int(self.monitor.get("consistency_rounds", 2)))
+        consistency_round_gap_sec = float(self.monitor.get("consistency_round_gap_sec", 0.2))
+        list_url = (
+            f"https://gym.whu.edu.cn/api/GSStadiums/GetAppointmentList?Version=2"
+            f"&SportsTypeId={type_id}&AppointmentDate={date_str}"
+        )
+        list_payload = self._api_fetch_json(list_url)
+        if int(list_payload.get("status", 0)) != 200:
             return []
 
+        resp = list_payload.get("response", {})
+        if not isinstance(resp, dict):
+            return []
+        data = resp.get("data", [])
+        if not isinstance(data, list):
+            return []
+
+        configured_venue_index = int(self.booking.get("venue_index", 0) or 0)
+        max_courts_default = int(self.monitor.get("api_max_courts_per_venue", 24))
+
         result: List[Dict[str, Any]] = []
-        for venue_index in range(1, max_venues + 1):
-            venue_xpath = venue_template.format(venue_index=venue_index)
-            venue_element = self._find_visible_element(venue_xpath)
-            if venue_element is None:
+        for i, item in enumerate(data, start=1):
+            if configured_venue_index > 0 and i != configured_venue_index:
+                continue
+            if not isinstance(item, dict):
                 continue
 
-            venue_name = normalize_text(venue_element.text) or f"venue-{venue_index}"
-            text_segment_count = self._segment_count_from_text(venue_name)
-            try:
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center',inline:'nearest'});", venue_element
-                )
-                venue_element.click()
-            except WebDriverException:
-                driver.execute_script("arguments[0].click();", venue_element)
-            time.sleep(analysis_wait_sec)
-
-            if text_segment_count:
-                result.append(
-                    {
-                        "venue_index": venue_index,
-                        "venue_name": venue_name,
-                        "available_total": sum(text_segment_count.values()),
-                        "segment_count": text_segment_count,
-                        "slot_details": [],
-                    }
-                )
+            venue_name = normalize_text(str(item.get("Title", ""))) or f"venue-{i}"
+            if not self._venue_name_matched(venue_name):
+                continue
+            area_id = int(item.get("StadiumsAreaId", 0) or 0)
+            if area_id <= 0:
                 continue
 
-            if court_number > 0 and court_template:
-                try:
-                    court_xpath = court_template.format(court_row_index=court_number + court_offset)
-                    self._wait_clickable(court_xpath, 5).click()
-                    time.sleep(analysis_wait_sec)
-                except TimeoutException:
-                    pass
+            LOGGER.info("API分析场馆[%s]: %s", i, venue_name)
+            if consistency_rounds > 1:
+                LOGGER.info("场馆[%s]一致性采样轮数: %s", i, consistency_rounds)
+
+            detail_court_slots: Dict[str, set[str]] = {}
+            total_capacity = max_courts_default
+            # First court probe to discover total capacity.
+            first_url = (
+                "https://gym.whu.edu.cn/api/GSStadiums/GetAppointmentDetail?Version=3"
+                f"&StadiumsAreaId={area_id}&StadiumsAreaNo=1&AppointmentDate={date_str}"
+            )
+            first_payload = self._api_fetch_json(first_url)
+            if int(first_payload.get("status", 0)) == 200:
+                first_resp = first_payload.get("response", {})
+                if isinstance(first_resp, dict):
+                    try:
+                        total_capacity = int(first_resp.get("StadiumsArea", {}).get("TotalCapacity", total_capacity) or total_capacity)
+                    except (TypeError, ValueError):
+                        total_capacity = max_courts_default
+
+            total_capacity = max(1, min(total_capacity, max_courts_default))
+
+            for round_idx in range(1, consistency_rounds + 1):
+                for area_no in range(1, total_capacity + 1):
+                    detail_url = (
+                        "https://gym.whu.edu.cn/api/GSStadiums/GetAppointmentDetail?Version=3"
+                        f"&StadiumsAreaId={area_id}&StadiumsAreaNo={area_no}&AppointmentDate={date_str}"
+                    )
+                    payload = self._api_fetch_json(detail_url)
+                    if int(payload.get("status", 0)) != 200:
+                        continue
+
+                    p_resp = payload.get("response", {})
+                    if not isinstance(p_resp, dict):
+                        continue
+
+                    times = p_resp.get("AppointmentTimes", [])
+                    if not isinstance(times, list):
+                        times = []
+
+                    for t in times:
+                        if not isinstance(t, dict):
+                            continue
+                        can = int(t.get("IsCanAppointment", 0) or 0) == 1
+                        remain = int(t.get("RemainingCapacity", 0) or 0)
+                        if not can or remain <= 0:
+                            continue
+                        start = str(t.get("StartTime", "")).strip().zfill(5)
+                        end = str(t.get("EndTime", "")).strip().zfill(5)
+                        if not start or not end:
+                            continue
+                        duration = self._duration_minutes(start, end)
+                        if duration < 45 or duration > 90:
+                            continue
+                        if not self._in_time_range(start, end):
+                            continue
+                        court_key = f"{area_no}号场"
+                        detail_court_slots.setdefault(court_key, set()).add(f"{start}-{end}")
+
+                if round_idx < consistency_rounds and consistency_round_gap_sec > 0:
+                    time.sleep(consistency_round_gap_sec)
+
+            detail_court_availability: Dict[str, List[str]] = {}
+            for court_name, slots_set in detail_court_slots.items():
+                slots = sorted(slots_set)
+                if slots:
+                    detail_court_availability[court_name] = slots
 
             slot_details: List[Dict[str, Any]] = []
-            for period in period_indexes:
-                period_idx = int(period)
-                slot_xpath = period_template.format(period_index=period_idx)
-                slot_element = self._find_visible_element(slot_xpath)
-                if slot_element is None:
-                    continue
-                meta = self._slot_meta(slot_element)
-                available = self._is_slot_available(meta)
-                slot_details.append(
-                    {
-                        "period_index": period_idx,
-                        "segment": self._segment_name(period_idx),
-                        "available": available,
-                        "text": normalize_text(str(meta.get("text", ""))),
-                    }
-                )
-
-            if not slot_details:
-                continue
+            for court_name, slots in detail_court_availability.items():
+                for label in slots:
+                    idx = self._period_index_from_label(label)
+                    slot_details.append(
+                        {
+                            "period_index": idx,
+                            "time_label": label,
+                            "segment": self._segment_name(idx) if idx > 0 else self._segment_name_from_time_label(label),
+                            "available": True,
+                            "court": court_name,
+                            "source": "api_detail",
+                        }
+                    )
 
             segment_count: Dict[str, int] = {}
-            for item in slot_details:
-                if item["available"]:
-                    segment_count[item["segment"]] = segment_count.get(item["segment"], 0) + 1
+            for slot in slot_details:
+                seg = str(slot.get("segment", "other"))
+                segment_count[seg] = segment_count.get(seg, 0) + 1
 
             result.append(
                 {
-                    "venue_index": venue_index,
+                    "venue_index": i,
                     "venue_name": venue_name,
-                    "available_total": sum(segment_count.values()),
+                    "available_total": len(slot_details),
                     "segment_count": segment_count,
                     "slot_details": slot_details,
+                    "court_availability": detail_court_availability,
                 }
             )
         return result
 
-    def dump_xpath_candidates(self) -> None:
-        keywords = list(self.monitor.get("available_keywords", [])) + list(
-            self.monitor.get("unavailable_keywords", [])
-        )
-        candidates = self._discover_keyword_nodes(keywords)
-        payload = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "url": self._must_driver().current_url,
-            "count": len(candidates),
-            "candidates": candidates,
-        }
-        out_path = Path(str(self.monitor.get("xpath_dump_file", "xpath_candidates.json"))).resolve()
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        LOGGER.info("已导出 XPath 候选到 %s", out_path)
-
-    def dump_html_snapshot(self) -> None:
-        if not bool(self.monitor.get("dump_html_on_check", False)):
-            return
-        out_path = Path(str(self.monitor.get("html_snapshot_file", "page_snapshot.html"))).resolve()
-        html = self._must_driver().page_source
-        out_path.write_text(html, encoding="utf-8")
-        LOGGER.info("已导出 HTML 快照到 %s", out_path)
+    def _structured_availability(self) -> List[Dict[str, Any]]:
+        return self._structured_availability_via_api()
 
     def check_availability(self) -> Dict[str, Any]:
-        driver = self._must_driver()
-        self.dump_html_snapshot()
+        self._ensure_reserve_page()
         venues = self._structured_availability()
-        if venues:
-            self.structured_warned = False
-            positives = []
-            for venue in venues:
-                morning = venue["segment_count"].get("morning", 0)
-                afternoon = venue["segment_count"].get("afternoon", 0)
-                evening = venue["segment_count"].get("evening", 0)
-                positives.append(
-                    f"{venue['venue_name']} | 上午:{'有' if morning > 0 else '无'}({morning}) 下午:{'有' if afternoon > 0 else '无'}({afternoon}) 晚上:{'有' if evening > 0 else '无'}({evening}) 总计:{venue['available_total']}"
-                )
-            has_available = any(v["available_total"] > 0 for v in venues)
-            return {
-                "has_available": has_available,
-                "positives": positives,
-                "negatives": [],
-                "url": driver.current_url,
-                "venues": venues,
-            }
-        if not self.structured_warned and str(self.monitor.get("venue_xpath_template", "")).strip():
-            LOGGER.warning("结构化分析未命中场馆，请检查 monitor.venue_xpath_template 与 period_xpath_template")
-            self.structured_warned = True
 
-        available_keywords = list(self.monitor.get("available_keywords", []))
-        unavailable_keywords = list(self.monitor.get("unavailable_keywords", []))
-
-        snippets: List[str] = []
-        for xpath in self.monitor.get("available_xpath_candidates", []):
-            try:
-                elements = driver.find_elements(By.XPATH, xpath)
-                snippets.extend(normalize_text(el.text) for el in elements if el.text.strip())
-            except InvalidSelectorException:
-                LOGGER.warning("无效 XPath: %s", xpath)
-
-        discovered = self._discover_keyword_nodes(available_keywords + unavailable_keywords)
-        snippets.extend(normalize_text(item["text"]) for item in discovered if item.get("text"))
+        deduped_by_name: Dict[str, Dict[str, Any]] = {}
+        for v in venues:
+            key = normalize_text(str(v.get("venue_name", ""))) or str(v.get("venue_index", ""))
+            old = deduped_by_name.get(key)
+            if old is None or int(v.get("available_total", 0)) > int(old.get("available_total", 0)):
+                deduped_by_name[key] = v
+        venues = list(deduped_by_name.values())
 
         positives: List[str] = []
-        negatives: List[str] = []
-        for text in snippets:
-            has_pos = contains_any(text, available_keywords)
-            has_neg = contains_any(text, unavailable_keywords)
-            if has_pos and not has_neg:
-                positives.append(text)
-            elif has_neg:
-                negatives.append(text)
+        for venue in venues:
+            if int(venue.get("available_total", 0)) <= 0:
+                continue
+            court_avail = venue.get("court_availability", {})
+            court_lines: List[str] = []
+            if isinstance(court_avail, dict):
+                for court_name in sorted(court_avail.keys(), key=lambda x: int(re.findall(r"\d+", x)[0]) if re.findall(r"\d+", x) else 999):
+                    times = [str(x) for x in court_avail.get(court_name, []) if str(x)]
+                    if times:
+                        court_lines.append(f"{court_name}:{'、'.join(times)}")
+            positives.append(f"{venue['venue_name']} | {'; '.join(court_lines) if court_lines else '无'}")
 
-        unique_pos = sorted(set(positives))
-        unique_neg = sorted(set(negatives))
-        has_available = len(unique_pos) > 0
         return {
-            "has_available": has_available,
-            "positives": unique_pos,
-            "negatives": unique_neg,
-            "url": driver.current_url,
-            "venues": [],
+            "has_available": len(positives) > 0,
+            "positives": positives,
+            "negatives": [],
+            "url": self._must_driver().current_url,
+            "venues": venues,
         }
 
     def log_availability(self, result: Dict[str, Any]) -> None:
-        venues = result.get("venues", [])
-        if isinstance(venues, list) and venues:
-            for line in result.get("positives", []):
-                LOGGER.info("余量分析: %s", line)
+        for line in result.get("positives", []):
+            LOGGER.info("余量分析: %s", line)
+        if not result.get("positives"):
+            LOGGER.info("当前未发现余量")
+
+    def _popup_alert(self, message: str) -> None:
+        if not bool(self.notification.get("popup", True)):
+            return
+        title = str(self.notification.get("popup_title", "场馆余量提醒")).strip() or "场馆余量提醒"
+
+        def _show() -> None:
+            try:
+                # MB_OK(0x0) | MB_ICONWARNING(0x30) | MB_SYSTEMMODAL(0x1000) | MB_TOPMOST(0x40000)
+                ctypes.windll.user32.MessageBoxW(0, message, title, 0x0 | 0x30 | 0x1000 | 0x40000)
+            except Exception:
+                LOGGER.exception("弹窗提醒失败")
+
+        threading.Thread(target=_show, daemon=True).start()
 
     def alert(self, result: Dict[str, Any]) -> None:
+        msg = "检测到场馆有余量: " + " | ".join(result.get("positives", [])[:8])
+
+        # For long-running monitoring, popup should be shown on every detection hit.
+        if bool(self.notification.get("popup_each_hit", True)):
+            self._popup_alert(msg)
+
         cooldown = int(self.monitor.get("alert_cooldown_sec", 300))
         now = time.time()
         if now - self.last_alert_ts < cooldown:
             return
 
         self.last_alert_ts = now
-        msg = "检测到场馆有余量: " + " | ".join(result["positives"][:8])
         LOGGER.warning(msg)
+
+        if not bool(self.notification.get("popup_each_hit", True)):
+            self._popup_alert(msg)
 
         if bool(self.notification.get("beep", True)) and winsound is not None:
             winsound.Beep(1300, 600)
@@ -861,63 +885,59 @@ return {
             except urlerror.URLError as e:
                 LOGGER.error("Webhook 发送失败: %s", e)
 
-
-def run_once(monitor: ZhihuiLuojiaMonitor, dump_xpath_only: bool) -> None:
+def run_once(monitor: ZhihuiLuojiaMonitor) -> None:
     monitor.login()
     monitor.open_reserve_page()
-    if bool(monitor.monitor.get("dump_xpath_on_start", True)) or dump_xpath_only:
-        monitor.dump_xpath_candidates()
-    if dump_xpath_only:
-        return
+    monitor._log_effective_query()
     result = monitor.check_availability()
     monitor.log_availability(result)
-    if result["has_available"]:
+    if result.get("has_available", False):
         monitor.alert(result)
-        monitor.try_book()
-    else:
-        LOGGER.info("当前未发现余量")
 
 
 def run_loop(monitor: ZhihuiLuojiaMonitor) -> None:
     monitor.login()
     monitor.open_reserve_page()
-    if bool(monitor.monitor.get("dump_xpath_on_start", True)):
-        monitor.dump_xpath_candidates()
+    monitor._log_effective_query()
 
     interval = int(monitor.monitor.get("interval_sec", 20))
     refresh_each_cycle = bool(monitor.monitor.get("refresh_each_cycle", True))
-    navigate_each_cycle = bool(monitor.monitor.get("navigate_each_cycle", False))
 
     while True:
         result = monitor.check_availability()
         monitor.log_availability(result)
-        if result["has_available"]:
+        if result.get("has_available", False):
             monitor.alert(result)
-            monitor.try_book()
-        else:
-            LOGGER.info("当前未发现余量")
         time.sleep(interval)
-        if navigate_each_cycle:
-            monitor.open_reserve_page()
-        elif refresh_each_cycle:
+        if refresh_each_cycle:
             monitor._must_driver().refresh()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="智慧珞珈场馆余量监测与自动预约（PC 网页版）")
+    parser = argparse.ArgumentParser(description="智慧珞珈场馆余量监测（API-only）")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--once", action="store_true", help="只检测一次")
-    parser.add_argument("--dump-xpath-only", action="store_true", help="只导出 XPath 候选后退出")
+    parser.add_argument(
+        "--sport",
+        choices=["badminton", "pingpong"],
+        default="badminton",
+        help="球类：badminton(羽毛球) 或 pingpong(乒乓球)，默认 badminton",
+    )
+    parser.add_argument("--venue", help="场馆筛选，支持多选逗号分隔；可用编号映射或名称关键字，例如 1,3 或 风雨,竹园")
+    parser.add_argument("--time-range", help="时段范围过滤，格式 HH:MM-HH:MM，例如 18:00-21:00")
+    parser.add_argument("--date", help="查询日期，格式 YYYY-MM-DD，例如 2026-04-14")
     parser.add_argument("--log-level", default="INFO", help="日志级别")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
     cfg = load_config(Path(args.config).resolve())
+    apply_runtime_overrides(cfg, args)
+
     monitor = ZhihuiLuojiaMonitor(cfg)
     monitor.start()
     try:
-        if args.once or args.dump_xpath_only:
-            run_once(monitor, dump_xpath_only=args.dump_xpath_only)
+        if args.once:
+            run_once(monitor)
         else:
             run_loop(monitor)
     finally:

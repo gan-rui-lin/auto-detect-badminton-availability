@@ -50,6 +50,8 @@ monitor:
   navigate_each_cycle: false
   dump_xpath_on_start: true
   xpath_dump_file: "xpath_candidates.json"
+  dump_slot_debug_on_check: true
+  slot_debug_file: "slot_debug.json"
   dump_html_on_check: false
   html_snapshot_file: "page_snapshot.html"
   analysis_wait_sec: 0.25
