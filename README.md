@@ -54,6 +54,20 @@ pip install -r requirements.txt
 
 ## 运行
 
+GUI 启动（Windows 桌面小应用原型）：
+
+```bash
+python monitor_gui.py
+```
+
+GUI 已支持：
+
+- 参数填写（sport / venue / time-range / date / once / email-alert）
+- 一键启动/停止监控
+- 实时查看日志输出
+- 打开最后一次调试快照（HTML/PNG）
+- 一键开机自启（写入 Startup 文件夹）
+
 球类参数（默认羽毛球）：
 
 ```bash
@@ -195,3 +209,13 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "monitor_pc
 ```
 
 注意：不要用 `Start-Process cmd /c ...` 的方式保存 PID。那样保存到 `monitor.pid` 的通常是 `cmd` 的 PID，不一定是实际 `python` 进程的 PID，可能导致“看似已停止但脚本仍在运行”。
+
+## GUI 开发建议
+
+当前 `monitor_gui.py` 是第一版原型，建议按下面顺序继续升级：
+
+1. 将参数保存到独立 profile（多套配置一键切换）
+2. 增加“测试登录 / 测试邮件”按钮，减少排障时间
+3. 增加历史检测记录面板（按日期/场馆过滤）
+4. 将监控核心抽成 service 层，GUI 只负责交互
+5. 后续再迁移到 PySide6 以获得更完整的 Windows 桌面体验
